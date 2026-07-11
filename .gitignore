@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node / Vite
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local logs and runtime output
+*.log
+*.out.log
+*.err.log
+
+# Generated debug images
+backend/debug-*.jpg
+backend/debug-*.png
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
