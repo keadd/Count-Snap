@@ -69,6 +69,8 @@ type DetectResponse = {
   candidateCount?: number;
   targetMatched?: boolean;
   roi?: DetectionRegion | null;
+  strategyScores?: Record<string, StrategyQuality>;
+  alternativeCounts?: Record<string, number>;
   params: {
     mode?: string;
     minArea: number;
@@ -77,7 +79,31 @@ type DetectResponse = {
     invert?: boolean;
     clusterCount?: number;
     minRepeat?: number;
+    selectedStrategy?: string;
+    selectionReason?: string;
   };
+};
+
+type StrategyQuality = {
+  score: number;
+  count: number;
+  nestedPairs: number;
+  overlapPairs: number;
+  areaCv: number;
+  sizeConsistency: number;
+};
+
+type SmartInfo = {
+  selectedStrategy: string;
+  strategyScores: Record<string, StrategyQuality>;
+  alternativeCounts: Record<string, number>;
+};
+
+type AutomaticView = {
+  detections: Detection[];
+  autoColorInfo: AutoColorInfo | null;
+  repeatInfo: RepeatInfo | null;
+  smartInfo: SmartInfo | null;
 };
 
 type RepeatGroup = {
@@ -135,8 +161,9 @@ type AutoColorInfo = {
 const defaultMinArea = 900;
 const defaultBlur = 7;
 const detectionModes = [
+  { value: 'smart', label: '智能检测' },
   { value: 'repeat_contours', label: '重复轮廓' },
-  { value: 'auto_color_blocks', label: '自动纯色检测' },
+  { value: 'auto_color_blocks', label: '自动色块' },
   { value: 'basic', label: '基础轮廓检测' },
 ] as const;
 const resizeCorners: ResizeCorner[] = ['nw', 'ne', 'sw', 'se'];
@@ -151,9 +178,10 @@ export function App() {
   const [threshold, setThreshold] = useState(0);
   const [blur, setBlur] = useState(defaultBlur);
   const [invert, setInvert] = useState(true);
-  const [mode, setMode] = useState<(typeof detectionModes)[number]['value']>('repeat_contours');
+  const [mode, setMode] = useState<(typeof detectionModes)[number]['value']>('smart');
   const [autoColorInfo, setAutoColorInfo] = useState<AutoColorInfo | null>(null);
   const [repeatInfo, setRepeatInfo] = useState<RepeatInfo | null>(null);
+  const [smartInfo, setSmartInfo] = useState<SmartInfo | null>(null);
   const [activeTool, setActiveTool] = useState<CanvasTool>(null);
   const [detectionRegion, setDetectionRegion] = useState<DetectionRegion | null>(null);
   const [roiDraft, setRoiDraft] = useState<DetectionRegion | null>(null);
@@ -171,6 +199,8 @@ export function App() {
   const suppressNextCanvasClickRef = useRef(false);
   const automaticDetectionsRef = useRef<Record<string, Detection[]>>({});
   const automaticGroupIdRef = useRef<string | null>(null);
+  const automaticStandaloneDetectionsRef = useRef<Detection[]>([]);
+  const automaticViewRef = useRef<AutomaticView | null>(null);
 
   const totalCount = detections.reduce((sum, detection) => sum + detection.count, 0);
 
@@ -188,6 +218,25 @@ export function App() {
       setActiveTool(null);
     }
   }, [activeTool, isMobileReview]);
+
+  useEffect(() => {
+    function handleImagePaste(event: ClipboardEvent) {
+      const imageItem = Array.from(event.clipboardData?.items ?? []).find((item) => item.type.startsWith('image/'));
+      const pastedImage = imageItem?.getAsFile();
+      if (!pastedImage) return;
+
+      event.preventDefault();
+      const extension = pastedImage.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+      const pastedFile = new File([pastedImage], `clipboard-${Date.now()}.${extension}`, {
+        type: pastedImage.type || 'image/png',
+        lastModified: Date.now(),
+      });
+      loadImageFile(pastedFile, 'paste');
+    }
+
+    window.addEventListener('paste', handleImagePaste);
+    return () => window.removeEventListener('paste', handleImagePaste);
+  }, []);
 
   useEffect(() => {
     function handleHistoryShortcut(event: KeyboardEvent) {
@@ -254,7 +303,7 @@ export function App() {
     setMessage('已重做上一步操作。');
   }
 
-  function loadImageFile(nextFile: File) {
+  function loadImageFile(nextFile: File, source: 'file' | 'paste' = 'file') {
     if (!nextFile.type.startsWith('image/')) {
       setMessage('请拖入或选择图片文件。');
       return;
@@ -268,6 +317,7 @@ export function App() {
     setDetections([]);
     setAutoColorInfo(null);
     setRepeatInfo(null);
+    setSmartInfo(null);
     setActiveTool(null);
     setDetectionRegion(null);
     setRoiDraft(null);
@@ -276,7 +326,9 @@ export function App() {
     setHistoryFuture([]);
     automaticDetectionsRef.current = {};
     automaticGroupIdRef.current = null;
-    setMessage('照片已载入，可以开始检测。');
+    automaticStandaloneDetectionsRef.current = [];
+    automaticViewRef.current = null;
+    setMessage(source === 'paste' ? '剪贴板图片已载入，可以开始检测。' : '照片已载入，可以开始检测。');
   }
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -318,7 +370,7 @@ export function App() {
       return;
     }
 
-    const uploadFile = mode === 'repeat_contours' ? file : await prepareImageForDetection(file);
+    const uploadFile = mode === 'repeat_contours' || mode === 'smart' ? file : await prepareImageForDetection(file);
     const requestedMinRepeat = Math.min(50, Math.max(2, Math.floor(minRepeat || 8)));
     const form = new FormData();
     form.append('image', uploadFile);
@@ -332,7 +384,7 @@ export function App() {
       form.append('target_x', String(options.targetPoint.x));
       form.append('target_y', String(options.targetPoint.y));
     }
-    if (detectionRegion && mode === 'repeat_contours') {
+    if (detectionRegion && (mode === 'repeat_contours' || mode === 'smart')) {
       form.append('roi_x', String(detectionRegion.x));
       form.append('roi_y', String(detectionRegion.y));
       form.append('roi_width', String(detectionRegion.width));
@@ -383,8 +435,9 @@ export function App() {
       setActiveTool(null);
       setTargetReference(options.targetPoint ?? null);
       if (data.roi !== undefined) setDetectionRegion(cloneRegion(data.roi ?? null));
+      const selectedStrategy = data.params.selectedStrategy ?? data.params.mode ?? mode;
       const nextAutoColorInfo =
-        data.params.mode === 'auto_color_blocks'
+        selectedStrategy === 'auto_color_blocks'
           ? {
               selectedColor: data.selectedColor ?? null,
               selectedScore: data.selectedScore ?? 0,
@@ -393,7 +446,7 @@ export function App() {
           : null;
       setAutoColorInfo(nextAutoColorInfo);
       const nextRepeatInfo =
-        data.params.mode === 'repeat_contours'
+        selectedStrategy === 'repeat_contours'
           ? {
               selectedGroupId: nextSelectedGroupId,
               selectedGroup: nextSelectedGroup,
@@ -402,19 +455,38 @@ export function App() {
             }
           : null;
       setRepeatInfo(nextRepeatInfo);
-      automaticDetectionsRef.current = Object.fromEntries(
-        nextGroups.map((group) => [group.id, cloneDetections(group.detections as Detection[])]),
-      );
-      if (!options.targetPoint) automaticGroupIdRef.current = nextSelectedGroupId;
+      const nextSmartInfo = data.params.mode === 'smart'
+        ? {
+            selectedStrategy,
+            strategyScores: data.strategyScores ?? {},
+            alternativeCounts: data.alternativeCounts ?? {},
+          }
+        : null;
+      setSmartInfo(nextSmartInfo);
+      if (!options.targetPoint) {
+        automaticDetectionsRef.current = Object.fromEntries(
+          nextGroups.map((group) => [group.id, cloneDetections(group.detections as Detection[])]),
+        );
+        automaticGroupIdRef.current = nextSelectedGroupId;
+        automaticStandaloneDetectionsRef.current = cloneDetections(nextDetections);
+        automaticViewRef.current = {
+          detections: cloneDetections(nextDetections),
+          autoColorInfo: nextAutoColorInfo,
+          repeatInfo: nextRepeatInfo,
+          smartInfo: nextSmartInfo,
+        };
+      }
       const nextTotal = nextDetections.reduce((sum, detection) => sum + detection.count, 0);
       const colorSuffix = nextAutoColorInfo?.selectedColor ? `自动目标色 ${nextAutoColorInfo.selectedColor.hex}。` : '';
       const repeatSuffix = nextRepeatInfo?.selectedGroup
         ? `重复组相似度 ${Math.round(nextRepeatInfo.selectedGroup.meanSimilarity * 100)}%。`
         : '';
-      if (data.params.mode === 'repeat_contours' && !nextRepeatInfo?.selectedGroup) {
+      const strategyLabel = selectedStrategy === 'auto_color_blocks' ? '自动色块' : selectedStrategy === 'repeat_contours' ? '重复轮廓' : '基础轮廓';
+      const smartSuffix = nextSmartInfo ? `智能检测采用${strategyLabel}策略。` : '';
+      if (selectedStrategy === 'repeat_contours' && !nextRepeatInfo?.selectedGroup) {
         setMessage(`找到了 ${nextRepeatInfo?.candidateCount ?? 0} 个候选色块，但没有形成至少 ${requestedMinRepeat} 个相似轮廓的重复组。可以降低最低重复数量或最小面积后重试。`);
       } else {
-        setMessage(`已识别 ${nextDetections.length} 个区域，当前总数为 ${nextTotal}。${colorSuffix}${repeatSuffix}如果一个框里有多个物体，可以手动修改数量。`);
+        setMessage(`已识别 ${nextDetections.length} 个区域，当前总数为 ${nextTotal}。${smartSuffix}${colorSuffix}${repeatSuffix}如果一个框里有多个物体，可以手动修改数量。`);
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -445,7 +517,26 @@ export function App() {
   }
 
   function restoreAutomaticResult() {
-    if (!repeatInfo) return;
+    const automaticView = automaticViewRef.current;
+    if (targetReference && automaticView) {
+      pushHistory();
+      setDetections(cloneDetections(automaticView.detections));
+      setAutoColorInfo(automaticView.autoColorInfo);
+      setRepeatInfo(automaticView.repeatInfo);
+      setSmartInfo(automaticView.smartInfo);
+      setTargetReference(null);
+      setMessage('已恢复程序最初选择的检测策略和结果。');
+      return;
+    }
+
+    if (!repeatInfo) {
+      const baseline = automaticStandaloneDetectionsRef.current;
+      if (!baseline.length) return;
+      pushHistory();
+      setDetections(cloneDetections(baseline));
+      setMessage('已恢复自动检测结果。');
+      return;
+    }
     const automaticGroupId = automaticGroupIdRef.current;
     const groupId = automaticGroupId && repeatInfo.groups.some((group) => group.id === automaticGroupId)
       ? automaticGroupId
@@ -837,6 +928,9 @@ export function App() {
   const selectedFileName = file?.name ?? '';
   const fileNameParts = file ? splitFileName(file.name) : null;
   const visibleRegion = roiDraft ?? detectionRegion;
+  const smartStrategyLabel = smartInfo?.selectedStrategy === 'auto_color_blocks' ? '自动色块' : smartInfo?.selectedStrategy === 'repeat_contours' ? '重复轮廓' : '等待检测';
+  const smartQuality = smartInfo ? smartInfo.strategyScores[smartInfo.selectedStrategy] : null;
+  const smartPreviewColor = autoColorInfo?.selectedColor?.hex ?? repeatInfo?.selectedGroup?.color.hex ?? '#ffffff';
   const stageModeLabel = isMobileReview && activeTool === null
     ? hasImage ? '手机端查看标注' : '等待照片'
     : activeTool === 'target'
@@ -852,7 +946,7 @@ export function App() {
       <section className="topbar">
         <div className="brand-block">
           <div>
-            <p className="eyebrow">CountSnap v0.3</p>
+            <p className="eyebrow">CountSnap v0.4</p>
             <h1>拍照数物体</h1>
             <p className="subtitle">上传或现场拍摄照片，自动框选分散物体，再按实际情况微调数量。</p>
           </div>
@@ -885,14 +979,14 @@ export function App() {
             <label className="upload-button" htmlFor="image-upload-input">
               选择图片
             </label>
-            <strong>选择或拍摄照片</strong>
+            <strong>选择、拍摄或粘贴照片</strong>
             {fileNameParts ? (
               <span className="upload-file-name" title={selectedFileName}>
                 <span>{fileNameParts.head}</span>
                 <b>{fileNameParts.tail}</b>
               </span>
             ) : (
-              <span>也可以把图片直接拖到这里或画布区域。</span>
+              <span>也可以拖入图片，或截图后按 Ctrl+V 粘贴。</span>
             )}
             {file && <small className="upload-meta">{imageMeta}</small>}
           </div>
@@ -923,6 +1017,21 @@ export function App() {
                 ))}
               </select>
             </label>
+            {mode === 'smart' && (
+              <div className="wide-field auto-color-card">
+                <span>智能检测策略</span>
+                <div className="auto-color-preview">
+                  <i style={{ backgroundColor: smartPreviewColor }} />
+                  <b>{smartStrategyLabel}</b>
+                  {smartQuality && <small>质量 {smartQuality.score.toFixed(1)}</small>}
+                </div>
+                <small>
+                  {smartInfo
+                    ? `色块 ${smartInfo.alternativeCounts.auto_color_blocks ?? smartInfo.strategyScores.auto_color_blocks?.count ?? '-'} 个，轮廓 ${smartInfo.alternativeCounts.repeat_contours ?? smartInfo.strategyScores.repeat_contours?.count ?? '-'} 个，已自动选择更可靠的结果。`
+                    : '会比较色块和重复轮廓结果，自动选择内嵌框更少、尺寸更一致的一组。'}
+                </small>
+              </div>
+            )}
             {mode === 'auto_color_blocks' && (
               <div className="wide-field auto-color-card">
                 <span>自动目标色</span>
@@ -959,7 +1068,7 @@ export function App() {
               最小面积
               <input type="number" min="10" step="50" value={minArea} onChange={(event) => setMinArea(Number(event.target.value))} />
             </label>
-            {mode === 'repeat_contours' && (
+            {(mode === 'repeat_contours' || mode === 'smart') && (
               <label>
                 最低重复数量
                 <input type="number" min="2" max="50" value={minRepeat} onChange={(event) => setMinRepeat(Number(event.target.value))} />
@@ -990,11 +1099,11 @@ export function App() {
               {isDetecting ? '检测中...' : '开始检测'}
             </button>
             <div className="tool-grid">
-              <button className={activeTool === 'target' ? 'secondary-button active' : 'secondary-button'} disabled={!hasImage || mode !== 'repeat_contours' || isDetecting} onClick={() => toggleCanvasTool('target')} title="点击一个零件并寻找相似目标">
+              <button className={activeTool === 'target' ? 'secondary-button active' : 'secondary-button'} disabled={!hasImage || !['repeat_contours', 'smart'].includes(mode) || isDetecting} onClick={() => toggleCanvasTool('target')} title="点击一个零件并寻找相似目标">
                 <Crosshair aria-hidden="true" size={16} />
                 {activeTool === 'target' ? '取消选择' : '选择目标'}
               </button>
-              <button className={activeTool === 'roi' ? 'secondary-button active' : 'secondary-button'} disabled={!hasImage || mode !== 'repeat_contours' || isDetecting} onClick={() => toggleCanvasTool('roi')} title="框选需要检测的图片范围">
+              <button className={activeTool === 'roi' ? 'secondary-button active' : 'secondary-button'} disabled={!hasImage || !['repeat_contours', 'smart'].includes(mode) || isDetecting} onClick={() => toggleCanvasTool('roi')} title="框选需要检测的图片范围">
                 <SquareDashedMousePointer aria-hidden="true" size={16} />
                 {activeTool === 'roi' ? '取消框选' : '框选范围'}
               </button>
@@ -1010,7 +1119,7 @@ export function App() {
             <div className="history-toolbar">
               <button className="secondary-button" disabled={!historyPast.length} onClick={undoEdit} title="撤销上一步操作"><Undo2 aria-hidden="true" size={16} />撤销</button>
               <button className="secondary-button" disabled={!historyFuture.length} onClick={redoEdit} title="重做上一步操作"><Redo2 aria-hidden="true" size={16} />重做</button>
-              <button className="secondary-button" disabled={!repeatInfo?.selectedGroupId || !automaticDetectionsRef.current[repeatInfo.selectedGroupId]} onClick={restoreAutomaticResult} title="恢复当前候选组最初的检测框"><RotateCcw aria-hidden="true" size={16} />恢复</button>
+              <button className="secondary-button" disabled={!automaticStandaloneDetectionsRef.current.length && (!repeatInfo?.selectedGroupId || !automaticDetectionsRef.current[repeatInfo.selectedGroupId])} onClick={restoreAutomaticResult} title="恢复自动检测结果"><RotateCcw aria-hidden="true" size={16} />恢复</button>
             </div>
             <button className="secondary-button" disabled={!detections.length} onClick={exportAnnotatedImage}>
               <Download aria-hidden="true" size={17} />
@@ -1039,7 +1148,7 @@ export function App() {
               <small>{file ? imageMeta : '空画布'}</small>
             </div>
           </div>
-          {!hasImage && <div className="empty-state">这里会显示待检测照片。适合苹果、瓶盖、硬币、零件等彼此分开的物体。也可以把图片拖到这里上传。</div>}
+          {!hasImage && <div className="empty-state">这里会显示待检测照片。可以选择、拖入图片，或截图后直接按 Ctrl+V 粘贴。</div>}
           {hasImage && (
             <div className="image-wrap">
               <img

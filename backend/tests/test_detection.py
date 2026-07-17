@@ -5,7 +5,7 @@ import unittest
 import cv2
 import numpy as np
 
-from app.detection import detect_repeated_contours
+from app.detection import _deduplicate_group_detections, detect_repeated_contours, detect_smart_objects
 
 
 def _make_repeated_parts_image(part_count: int) -> bytes:
@@ -134,6 +134,29 @@ class RepeatedContourDetectionTests(unittest.TestCase):
         self.assertEqual(result["candidateCount"], 8)
         self.assertEqual(result["count"], 8)
         self.assertEqual(result["repeatGroups"][0]["count"], 8)
+
+    def test_final_group_deduplication_keeps_outer_box(self) -> None:
+        detections = [
+            {"id": "outer", "bbox": [100, 100, 90, 90], "area": 8100, "count": 1},
+            {"id": "inner", "bbox": [112, 112, 62, 62], "area": 3844, "count": 1},
+        ]
+
+        result = _deduplicate_group_detections(detections)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["id"], "outer")
+
+    def test_smart_mode_returns_strategy_quality(self) -> None:
+        result = detect_smart_objects(
+            _make_two_groups_image(),
+            min_area=600,
+            min_repeat=8,
+        )
+
+        self.assertEqual(result["count"], 10)
+        self.assertEqual(result["params"]["mode"], "smart")
+        self.assertEqual(result["params"]["selectedStrategy"], "repeat_contours")
+        self.assertEqual(set(result["strategyScores"]), {"repeat_contours", "auto_color_blocks"})
 
 
 if __name__ == "__main__":

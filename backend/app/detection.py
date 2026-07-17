@@ -213,6 +213,67 @@ def _are_repeat_candidates_duplicate(left: dict, right: dict) -> bool:
     return area_ratio >= 0.42 and color_distance <= 50.0 and shape_distance <= 0.72
 
 
+def _deduplicate_group_detections(detections: list[dict]) -> list[dict]:
+    ordered = sorted(
+        detections,
+        key=lambda item: item["bbox"][2] * item["bbox"][3],
+        reverse=True,
+    )
+    kept = []
+    for detection in ordered:
+        bbox = tuple(int(value) for value in detection["bbox"])
+        if any(
+            _bbox_iou(bbox, tuple(int(value) for value in item["bbox"])) >= 0.62
+            or _bbox_containment(bbox, tuple(int(value) for value in item["bbox"])) >= 0.82
+            for item in kept
+        ):
+            continue
+        kept.append(detection)
+    kept.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    return kept
+
+
+def _score_detection_result(result: dict, min_repeat: int) -> dict:
+    detections = result.get("detections", [])
+    boxes = [tuple(int(value) for value in detection["bbox"]) for detection in detections]
+    nested_pairs = 0
+    overlap_pairs = 0
+    for left_index in range(len(boxes)):
+        for right_index in range(left_index + 1, len(boxes)):
+            if _bbox_containment(boxes[left_index], boxes[right_index]) >= 0.82:
+                nested_pairs += 1
+            elif _bbox_iou(boxes[left_index], boxes[right_index]) >= 0.35:
+                overlap_pairs += 1
+
+    areas = np.array(
+        [max(1.0, float(detection.get("area", detection["bbox"][2] * detection["bbox"][3]))) for detection in detections],
+        dtype=float,
+    )
+    median_area = float(np.median(areas)) if len(areas) else 0.0
+    area_cv = float(np.std(areas) / median_area) if median_area else 3.0
+    size_consistency = 1.0 / (1.0 + min(area_cv, 3.0) * 2.0)
+    count = len(detections)
+    score = count * 1.45 + size_consistency * 22.0 - nested_pairs * 18.0 - overlap_pairs * 7.0
+    if count < min_repeat:
+        score -= 24.0
+
+    repeat_group = result.get("selectedRepeatGroup")
+    if repeat_group:
+        score += float(repeat_group.get("meanSimilarity", 0.0)) * 12.0
+    selected_score = float(result.get("selectedScore", 0.0))
+    if selected_score:
+        score += float(np.tanh(max(0.0, selected_score) / 35.0)) * 12.0
+
+    return {
+        "score": round(float(score), 3),
+        "count": count,
+        "nestedPairs": nested_pairs,
+        "overlapPairs": overlap_pairs,
+        "areaCv": round(area_cv, 3),
+        "sizeConsistency": round(size_consistency, 3),
+    }
+
+
 def _repeat_similarity(left: dict, right: dict) -> tuple[float, float]:
     area_similarity = min(left["area"], right["area"]) / max(left["area"], right["area"])
     aspect_similarity = float(np.exp(-abs(np.log(left["aspect"] / right["aspect"]))))
@@ -598,17 +659,23 @@ def detect_repeated_contours(
                     "count": 1,
                 }
             )
-        group_detections.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+        raw_detection_count = len(group_detections)
+        group_detections = _deduplicate_group_detections(group_detections)
         for index, detection in enumerate(group_detections, start=1):
             detection["label"] = str(index)
 
         public_group = {key: value for key, value in group.items() if key != "members"}
-        public_group["meetsMinimum"] = group["count"] >= min_repeat
+        public_group["rawCount"] = raw_detection_count
+        public_group["count"] = len(group_detections)
+        public_group["meetsMinimum"] = len(group_detections) >= min_repeat
         public_group["detections"] = group_detections
         public_groups.append(public_group)
 
     selected_group_id = selected_group["id"] if selected_group else None
     public_selected_group = next((group for group in public_groups if group["id"] == selected_group_id), None)
+    if target_group is None and (not public_selected_group or not public_selected_group["meetsMinimum"]):
+        public_selected_group = next((group for group in public_groups if group["meetsMinimum"]), None)
+        selected_group_id = public_selected_group["id"] if public_selected_group else None
     detections = public_selected_group["detections"] if public_selected_group else []
     return {
         "count": len(detections),
@@ -963,6 +1030,61 @@ def detect_auto_color_blocks(
             "clusterCount": cluster_count,
         },
     }
+
+
+def detect_smart_objects(
+    image_bytes: bytes,
+    min_area: int = 900,
+    min_repeat: int = 8,
+    target_point: tuple[float, float] | None = None,
+    roi: tuple[int, int, int, int] | None = None,
+) -> dict:
+    repeated_result = detect_repeated_contours(
+        image_bytes=image_bytes,
+        min_area=min_area,
+        min_repeat=min_repeat,
+        target_point=target_point,
+        roi=roi,
+    )
+    repeated_quality = _score_detection_result(repeated_result, min_repeat)
+
+    if target_point is not None or roi is not None:
+        selected = dict(repeated_result)
+        selected["strategyScores"] = {"repeat_contours": repeated_quality}
+        selected["params"] = {
+            **repeated_result.get("params", {}),
+            "mode": "smart",
+            "selectedStrategy": "repeat_contours",
+            "selectionReason": "interactive_constraint",
+        }
+        return selected
+
+    color_result = detect_auto_color_blocks(image_bytes=image_bytes, min_area=min_area)
+    color_quality = _score_detection_result(color_result, min_repeat)
+    strategy_scores = {
+        "repeat_contours": repeated_quality,
+        "auto_color_blocks": color_quality,
+    }
+    if color_quality["score"] >= repeated_quality["score"]:
+        selected_strategy = "auto_color_blocks"
+        selected_result = color_result
+    else:
+        selected_strategy = "repeat_contours"
+        selected_result = repeated_result
+
+    selected = dict(selected_result)
+    selected["strategyScores"] = strategy_scores
+    selected["alternativeCounts"] = {
+        "repeat_contours": repeated_result.get("count", 0),
+        "auto_color_blocks": color_result.get("count", 0),
+    }
+    selected["params"] = {
+        **selected_result.get("params", {}),
+        "mode": "smart",
+        "selectedStrategy": selected_strategy,
+        "selectionReason": "quality_score",
+    }
+    return selected
 
 
 def detect_colored_objects(

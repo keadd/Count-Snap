@@ -3,9 +3,9 @@
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from .detection import detect_auto_color_blocks, detect_objects, detect_repeated_contours
+from .detection import detect_auto_color_blocks, detect_objects, detect_repeated_contours, detect_smart_objects
 
-app = FastAPI(title="CountSnap API", version="0.3.0")
+app = FastAPI(title="CountSnap API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ def health() -> dict[str, str]:
 @app.post("/api/detect")
 async def detect(
     image: UploadFile = File(...),
-    mode: str = Form("repeat_contours"),
+    mode: str = Form("smart"),
     min_area: int = Form(900),
     min_repeat: int = Form(8),
     target_x: float | None = Form(None),
@@ -45,10 +45,20 @@ async def detect(
         raise HTTPException(status_code=400, detail="上传的图片是空文件。")
 
     try:
+        target_point = (target_x, target_y) if target_x is not None and target_y is not None else None
+        roi_values = (roi_x, roi_y, roi_width, roi_height)
+        roi = tuple(int(value) for value in roi_values) if all(value is not None for value in roi_values) else None
+
+        if mode == "smart":
+            return detect_smart_objects(
+                image_bytes=image_bytes,
+                min_area=min_area,
+                min_repeat=min_repeat,
+                target_point=target_point,
+                roi=roi,
+            )
+
         if mode == "repeat_contours":
-            target_point = (target_x, target_y) if target_x is not None and target_y is not None else None
-            roi_values = (roi_x, roi_y, roi_width, roi_height)
-            roi = tuple(int(value) for value in roi_values) if all(value is not None for value in roi_values) else None
             return detect_repeated_contours(
                 image_bytes=image_bytes,
                 min_area=min_area,
