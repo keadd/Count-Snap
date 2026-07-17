@@ -21,6 +21,9 @@ backend/debug-*.png
 # Local development documents
 dev-docs/
 
+# Private local regression photos
+backend/local-test-data/
+
 # OS/editor noise
 .DS_Store
 Thumbs.db

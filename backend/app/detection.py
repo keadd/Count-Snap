@@ -274,6 +274,80 @@ def _score_detection_result(result: dict, min_repeat: int) -> dict:
     }
 
 
+def _compare_detection_strategies(
+    selected_detections: list[dict],
+    alternative_detections: list[dict],
+    selected_strategy: str,
+    alternative_strategy: str,
+) -> tuple[list[dict], list[dict], dict]:
+    pairs = []
+    for selected_index, selected in enumerate(selected_detections):
+        selected_box = tuple(int(value) for value in selected["bbox"])
+        selected_x, selected_y, selected_width, selected_height = selected_box
+        selected_center = (selected_x + selected_width / 2, selected_y + selected_height / 2)
+        selected_diagonal = float(np.hypot(selected_width, selected_height))
+        for alternative_index, alternative in enumerate(alternative_detections):
+            alternative_box = tuple(int(value) for value in alternative["bbox"])
+            alternative_x, alternative_y, alternative_width, alternative_height = alternative_box
+            alternative_center = (
+                alternative_x + alternative_width / 2,
+                alternative_y + alternative_height / 2,
+            )
+            alternative_diagonal = float(np.hypot(alternative_width, alternative_height))
+            center_distance = float(
+                np.hypot(
+                    selected_center[0] - alternative_center[0],
+                    selected_center[1] - alternative_center[1],
+                )
+            )
+            normalized_distance = center_distance / max(12.0, (selected_diagonal + alternative_diagonal) / 2)
+            iou = _bbox_iou(selected_box, alternative_box)
+            containment = _bbox_containment(selected_box, alternative_box)
+            if iou < 0.18 and containment < 0.52 and normalized_distance > 0.34:
+                continue
+
+            match_score = max(iou, containment * 0.82, 1.0 - normalized_distance)
+            pairs.append((match_score, selected_index, alternative_index))
+
+    matched_selected = set()
+    matched_alternative = set()
+    for _, selected_index, alternative_index in sorted(pairs, reverse=True):
+        if selected_index in matched_selected or alternative_index in matched_alternative:
+            continue
+        matched_selected.add(selected_index)
+        matched_alternative.add(alternative_index)
+
+    compared_selected = []
+    for index, detection in enumerate(selected_detections):
+        compared_selected.append(
+            {
+                **detection,
+                "agreement": "matched" if index in matched_selected else "selected_only",
+            }
+        )
+
+    alternative_only = []
+    for index, detection in enumerate(alternative_detections):
+        if index in matched_alternative:
+            continue
+        alternative_only.append(
+            {
+                **detection,
+                "id": f"alternative_{alternative_strategy}_{detection['id']}",
+                "sourceStrategy": alternative_strategy,
+            }
+        )
+
+    difference = {
+        "selectedStrategy": selected_strategy,
+        "alternativeStrategy": alternative_strategy,
+        "matched": len(matched_selected),
+        "selectedOnly": len(selected_detections) - len(matched_selected),
+        "alternativeOnly": len(alternative_only),
+    }
+    return compared_selected, alternative_only, difference
+
+
 def _repeat_similarity(left: dict, right: dict) -> tuple[float, float]:
     area_similarity = min(left["area"], right["area"]) / max(left["area"], right["area"])
     aspect_similarity = float(np.exp(-abs(np.log(left["aspect"] / right["aspect"]))))
@@ -776,8 +850,21 @@ def detect_auto_color_blocks(
     image_bytes: bytes,
     min_area: int = 900,
     cluster_count: int = 8,
+    target_point: tuple[float, float] | None = None,
+    roi: tuple[int, int, int, int] | None = None,
 ) -> dict:
     _, work, scale, width, height = _decode_work_image(image_bytes)
+    normalized_roi = _normalize_roi(width, height, roi)
+    offset_x = 0
+    offset_y = 0
+    if normalized_roi:
+        roi_x, roi_y, roi_width, roi_height = normalized_roi
+        offset_x = int(round(roi_x * scale))
+        offset_y = int(round(roi_y * scale))
+        crop_x2 = min(work.shape[1], int(round((roi_x + roi_width) * scale)))
+        crop_y2 = min(work.shape[0], int(round((roi_y + roi_height) * scale)))
+        work = work[offset_y:crop_y2, offset_x:crop_x2]
+
     work_height, work_width = work.shape[:2]
     work_area = work_height * work_width
     lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -803,6 +890,12 @@ def detect_auto_color_blocks(
             "selectedColor": None,
             "selectedScore": 0,
             "candidateColorGroups": [],
+            "targetMatched": target_point is None,
+            "roi": (
+                {"x": normalized_roi[0], "y": normalized_roi[1], "width": normalized_roi[2], "height": normalized_roi[3]}
+                if normalized_roi
+                else None
+            ),
             "params": {"mode": "auto_color_blocks", "minArea": min_area},
         }
 
@@ -945,7 +1038,22 @@ def detect_auto_color_blocks(
             }
         )
 
-    selected_record = max(family_records, key=lambda item: item["candidate"]["score"]) if family_records else None
+    target_matched = target_point is None
+    target_records = []
+    if target_point is not None:
+        local_target = (target_point[0] * scale - offset_x, target_point[1] * scale - offset_y)
+        if 0 <= local_target[0] <= work_width and 0 <= local_target[1] <= work_height:
+            for record in family_records:
+                if any(
+                    component["x"] <= local_target[0] <= component["x"] + component["w"]
+                    and component["y"] <= local_target[1] <= component["y"] + component["h"]
+                    for component in record["validComponents"]
+                ):
+                    target_records.append(record)
+        target_matched = bool(target_records)
+
+    selection_pool = target_records if target_records else family_records
+    selected_record = max(selection_pool, key=lambda item: item["candidate"]["score"]) if selection_pool else None
     selected_group = selected_record["candidate"] if selected_record else None
     selected_components = selected_record["validComponents"] if selected_record else []
     selected_mask = selected_record["mask"] if selected_record else None
@@ -962,6 +1070,12 @@ def detect_auto_color_blocks(
             "selectedColor": selected_group["color"] if selected_group else None,
             "selectedScore": round(selected_score, 3),
             "candidateColorGroups": candidate_groups,
+            "targetMatched": target_matched,
+            "roi": (
+                {"x": normalized_roi[0], "y": normalized_roi[1], "width": normalized_roi[2], "height": normalized_roi[3]}
+                if normalized_roi
+                else None
+            ),
             "params": {
                 "mode": "auto_color_blocks",
                 "minArea": min_area,
@@ -988,6 +1102,12 @@ def detect_auto_color_blocks(
 
         if split_boxes:
             for bbox in split_boxes:
+                bbox = [
+                    bbox[0] + round(offset_x / scale),
+                    bbox[1] + round(offset_y / scale),
+                    bbox[2],
+                    bbox[3],
+                ]
                 detections.append(
                     {
                         "id": f"auto_color_{uuid.uuid4().hex[:8]}",
@@ -998,8 +1118,8 @@ def detect_auto_color_blocks(
                 )
         else:
             bbox = [
-                round(x / scale),
-                round(y / scale),
+                round((x + offset_x) / scale),
+                round((y + offset_y) / scale),
                 round(w / scale),
                 round(h / scale),
             ]
@@ -1024,6 +1144,12 @@ def detect_auto_color_blocks(
         "selectedColor": selected_group["color"],
         "selectedScore": round(selected_score, 3),
         "candidateColorGroups": candidate_groups,
+        "targetMatched": target_matched,
+        "roi": (
+            {"x": normalized_roi[0], "y": normalized_roi[1], "width": normalized_roi[2], "height": normalized_roi[3]}
+            if normalized_roi
+            else None
+        ),
         "params": {
             "mode": "auto_color_blocks",
             "minArea": min_area,
@@ -1047,32 +1173,50 @@ def detect_smart_objects(
         roi=roi,
     )
     repeated_quality = _score_detection_result(repeated_result, min_repeat)
-
-    if target_point is not None or roi is not None:
-        selected = dict(repeated_result)
-        selected["strategyScores"] = {"repeat_contours": repeated_quality}
-        selected["params"] = {
-            **repeated_result.get("params", {}),
-            "mode": "smart",
-            "selectedStrategy": "repeat_contours",
-            "selectionReason": "interactive_constraint",
-        }
-        return selected
-
-    color_result = detect_auto_color_blocks(image_bytes=image_bytes, min_area=min_area)
+    color_result = detect_auto_color_blocks(
+        image_bytes=image_bytes,
+        min_area=min_area,
+        target_point=target_point,
+        roi=roi,
+    )
     color_quality = _score_detection_result(color_result, min_repeat)
     strategy_scores = {
         "repeat_contours": repeated_quality,
         "auto_color_blocks": color_quality,
     }
-    if color_quality["score"] >= repeated_quality["score"]:
+    eligible_strategies = {"repeat_contours", "auto_color_blocks"}
+    if target_point is not None:
+        eligible_strategies = {
+            strategy
+            for strategy, result in {
+                "repeat_contours": repeated_result,
+                "auto_color_blocks": color_result,
+            }.items()
+            if result.get("targetMatched", False)
+        }
+
+    if "auto_color_blocks" in eligible_strategies and (
+        "repeat_contours" not in eligible_strategies or color_quality["score"] >= repeated_quality["score"]
+    ):
         selected_strategy = "auto_color_blocks"
         selected_result = color_result
     else:
         selected_strategy = "repeat_contours"
         selected_result = repeated_result
 
+    alternative_strategy = "repeat_contours" if selected_strategy == "auto_color_blocks" else "auto_color_blocks"
+    alternative_result = repeated_result if alternative_strategy == "repeat_contours" else color_result
+    compared_detections, alternative_detections, strategy_difference = _compare_detection_strategies(
+        selected_result.get("detections", []),
+        alternative_result.get("detections", []),
+        selected_strategy,
+        alternative_strategy,
+    )
+
     selected = dict(selected_result)
+    selected["detections"] = compared_detections
+    selected["alternativeDetections"] = alternative_detections
+    selected["strategyDifference"] = strategy_difference
     selected["strategyScores"] = strategy_scores
     selected["alternativeCounts"] = {
         "repeat_contours": repeated_result.get("count", 0),
@@ -1082,7 +1226,7 @@ def detect_smart_objects(
         **selected_result.get("params", {}),
         "mode": "smart",
         "selectedStrategy": selected_strategy,
-        "selectionReason": "quality_score",
+        "selectionReason": "target_match_quality" if target_point is not None else "quality_score",
     }
     return selected
 

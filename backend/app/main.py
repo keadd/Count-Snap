@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .detection import detect_auto_color_blocks, detect_objects, detect_repeated_contours, detect_smart_objects
 
-app = FastAPI(title="CountSnap API", version="0.4.0")
+app = FastAPI(title="CountSnap API", version="0.4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,6 +71,8 @@ async def detect(
             return detect_auto_color_blocks(
                 image_bytes=image_bytes,
                 min_area=min_area,
+                target_point=target_point,
+                roi=roi,
             )
 
         return detect_objects(

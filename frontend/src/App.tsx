@@ -11,9 +11,14 @@ type Detection = {
   count: number;
   label?: string;
   manual?: boolean;
+  agreement?: 'matched' | 'selected_only';
 };
 
 type ApiDetection = Omit<Detection, 'count'> & { count?: number };
+
+type AlternativeDetection = Detection & {
+  sourceStrategy: string;
+};
 
 type ResizeCorner = 'nw' | 'ne' | 'sw' | 'se';
 
@@ -44,6 +49,7 @@ type EditorSnapshot = {
   detections: Detection[];
   selectedGroupId: string | null;
   detectionRegion: DetectionRegion | null;
+  smartInfo: SmartInfo | null;
 };
 
 type RoiDragState = {
@@ -71,6 +77,8 @@ type DetectResponse = {
   roi?: DetectionRegion | null;
   strategyScores?: Record<string, StrategyQuality>;
   alternativeCounts?: Record<string, number>;
+  alternativeDetections?: Array<ApiDetection & { sourceStrategy: string }>;
+  strategyDifference?: StrategyDifference;
   params: {
     mode?: string;
     minArea: number;
@@ -97,6 +105,16 @@ type SmartInfo = {
   selectedStrategy: string;
   strategyScores: Record<string, StrategyQuality>;
   alternativeCounts: Record<string, number>;
+  alternativeDetections: AlternativeDetection[];
+  strategyDifference: StrategyDifference | null;
+};
+
+type StrategyDifference = {
+  selectedStrategy: string;
+  alternativeStrategy: string;
+  matched: number;
+  selectedOnly: number;
+  alternativeOnly: number;
 };
 
 type AutomaticView = {
@@ -262,6 +280,7 @@ export function App() {
       detections: cloneDetections(detections),
       selectedGroupId: repeatInfo?.selectedGroupId ?? null,
       detectionRegion: cloneRegion(detectionRegion),
+      smartInfo: cloneSmartInfo(smartInfo),
     };
   }
 
@@ -273,6 +292,7 @@ export function App() {
   function applySnapshot(snapshot: EditorSnapshot) {
     setDetections(cloneDetections(snapshot.detections));
     setDetectionRegion(cloneRegion(snapshot.detectionRegion));
+    setSmartInfo(cloneSmartInfo(snapshot.smartInfo));
     setRepeatInfo((current) => {
       if (!current) return current;
       const selectedGroup = current.groups.find((group) => group.id === snapshot.selectedGroupId) ?? null;
@@ -370,7 +390,7 @@ export function App() {
       return;
     }
 
-    const uploadFile = mode === 'repeat_contours' || mode === 'smart' ? file : await prepareImageForDetection(file);
+    const uploadFile = ['repeat_contours', 'smart', 'auto_color_blocks'].includes(mode) ? file : await prepareImageForDetection(file);
     const requestedMinRepeat = Math.min(50, Math.max(2, Math.floor(minRepeat || 8)));
     const form = new FormData();
     form.append('image', uploadFile);
@@ -384,7 +404,7 @@ export function App() {
       form.append('target_x', String(options.targetPoint.x));
       form.append('target_y', String(options.targetPoint.y));
     }
-    if (detectionRegion && (mode === 'repeat_contours' || mode === 'smart')) {
+    if (detectionRegion && ['repeat_contours', 'smart', 'auto_color_blocks'].includes(mode)) {
       form.append('roi_x', String(detectionRegion.x));
       form.append('roi_y', String(detectionRegion.y));
       form.append('roi_width', String(detectionRegion.width));
@@ -460,6 +480,11 @@ export function App() {
             selectedStrategy,
             strategyScores: data.strategyScores ?? {},
             alternativeCounts: data.alternativeCounts ?? {},
+            alternativeDetections: (data.alternativeDetections ?? []).map((detection) => ({
+              ...detection,
+              count: detection.count ?? 1,
+            })),
+            strategyDifference: data.strategyDifference ?? null,
           }
         : null;
       setSmartInfo(nextSmartInfo);
@@ -482,7 +507,10 @@ export function App() {
         ? `重复组相似度 ${Math.round(nextRepeatInfo.selectedGroup.meanSimilarity * 100)}%。`
         : '';
       const strategyLabel = selectedStrategy === 'auto_color_blocks' ? '自动色块' : selectedStrategy === 'repeat_contours' ? '重复轮廓' : '基础轮廓';
-      const smartSuffix = nextSmartInfo ? `智能检测采用${strategyLabel}策略。` : '';
+      const differenceSuffix = nextSmartInfo?.strategyDifference
+        ? `两种策略一致 ${nextSmartInfo.strategyDifference.matched} 个，待复核 ${nextSmartInfo.strategyDifference.selectedOnly + nextSmartInfo.strategyDifference.alternativeOnly} 个。`
+        : '';
+      const smartSuffix = nextSmartInfo ? `智能检测采用${strategyLabel}策略。${differenceSuffix}` : '';
       if (selectedStrategy === 'repeat_contours' && !nextRepeatInfo?.selectedGroup) {
         setMessage(`找到了 ${nextRepeatInfo?.candidateCount ?? 0} 个候选色块，但没有形成至少 ${requestedMinRepeat} 个相似轮廓的重复组。可以降低最低重复数量或最小面积后重试。`);
       } else {
@@ -511,6 +539,7 @@ export function App() {
     const nextTarget = nextGroups.find((group) => group.id === groupId) ?? targetGroup;
     setRepeatInfo({ ...repeatInfo, groups: nextGroups, selectedGroupId: groupId, selectedGroup: nextTarget });
     setDetections(cloneDetections(nextTarget.detections as Detection[]));
+    setSmartInfo(null);
     setTargetReference(null);
     setActiveTool(null);
     setMessage(`已切换到候选组，共 ${nextTarget.count} 个相似区域。`);
@@ -549,6 +578,7 @@ export function App() {
     setDetections(cloneDetections(baseline));
     const selectedGroup = repeatInfo.groups.find((group) => group.id === groupId) ?? null;
     setRepeatInfo({ ...repeatInfo, selectedGroupId: groupId, selectedGroup });
+    setSmartInfo(groupId === automaticGroupIdRef.current ? cloneSmartInfo(automaticViewRef.current?.smartInfo ?? null) : null);
     setTargetReference(null);
     setMessage(groupId === repeatInfo.selectedGroupId ? '已恢复当前候选组的自动检测结果。' : '已恢复程序最初选择的候选组。');
   }
@@ -583,9 +613,50 @@ export function App() {
   }
 
   function removeDetection(id: string) {
-    if (!detections.some((item) => item.id === id)) return;
+    const removed = detections.find((item) => item.id === id);
+    if (!removed) return;
     pushHistory();
     setDetections((current) => relabel(current.filter((item) => item.id !== id)));
+    if (removed.agreement === 'selected_only') {
+      setSmartInfo((current) => current?.strategyDifference
+        ? {
+            ...current,
+            strategyDifference: {
+              ...current.strategyDifference,
+              selectedOnly: Math.max(0, current.strategyDifference.selectedOnly - 1),
+            },
+          }
+        : current);
+    }
+  }
+
+  function adoptAlternativeDetection(id: string) {
+    const suggestion = smartInfo?.alternativeDetections.find((item) => item.id === id);
+    if (!suggestion) return;
+
+    pushHistory();
+    const adopted: Detection = {
+      ...suggestion,
+      id: `adopted_${Date.now()}`,
+      bbox: [...suggestion.bbox],
+      manual: true,
+      agreement: undefined,
+    };
+    setDetections((current) => relabel([...current, adopted]));
+    setSmartInfo((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        alternativeDetections: current.alternativeDetections.filter((item) => item.id !== id),
+        strategyDifference: current.strategyDifference
+          ? {
+              ...current.strategyDifference,
+              alternativeOnly: Math.max(0, current.strategyDifference.alternativeOnly - 1),
+            }
+          : null,
+      };
+    });
+    setMessage('已采用备选策略中的一个区域，可以继续调整位置、大小或数量。');
   }
 
   function updateDetectionCount(id: string, count: number) {
@@ -907,8 +978,9 @@ export function App() {
       const [x, y, w, h] = detection.bbox;
       const text = `${index + 1}${detection.count > 1 ? ` x${detection.count}` : ''}`;
       const labelWidth = Math.max(54, text.length * Math.max(14, imageSize.width / 68));
-      context.strokeStyle = detection.manual ? '#d85a2a' : '#2f6f9f';
-      context.fillStyle = detection.manual ? '#d85a2a' : '#2f6f9f';
+      const annotationColor = detection.manual ? '#d85a2a' : detection.agreement === 'selected_only' ? '#c98212' : '#2f6f9f';
+      context.strokeStyle = annotationColor;
+      context.fillStyle = annotationColor;
       context.strokeRect(x, y, w, h);
       context.fillRect(x, Math.max(0, y - 32), labelWidth, 30);
       context.fillStyle = '#ffffff';
@@ -946,7 +1018,7 @@ export function App() {
       <section className="topbar">
         <div className="brand-block">
           <div>
-            <p className="eyebrow">CountSnap v0.4</p>
+            <p className="eyebrow">CountSnap v0.4.1</p>
             <h1>拍照数物体</h1>
             <p className="subtitle">上传或现场拍摄照片，自动框选分散物体，再按实际情况微调数量。</p>
           </div>
@@ -1099,11 +1171,11 @@ export function App() {
               {isDetecting ? '检测中...' : '开始检测'}
             </button>
             <div className="tool-grid">
-              <button className={activeTool === 'target' ? 'secondary-button active' : 'secondary-button'} disabled={!hasImage || !['repeat_contours', 'smart'].includes(mode) || isDetecting} onClick={() => toggleCanvasTool('target')} title="点击一个零件并寻找相似目标">
+              <button className={activeTool === 'target' ? 'secondary-button active' : 'secondary-button'} disabled={!hasImage || !['repeat_contours', 'smart', 'auto_color_blocks'].includes(mode) || isDetecting} onClick={() => toggleCanvasTool('target')} title="点击一个零件并寻找相似目标">
                 <Crosshair aria-hidden="true" size={16} />
                 {activeTool === 'target' ? '取消选择' : '选择目标'}
               </button>
-              <button className={activeTool === 'roi' ? 'secondary-button active' : 'secondary-button'} disabled={!hasImage || !['repeat_contours', 'smart'].includes(mode) || isDetecting} onClick={() => toggleCanvasTool('roi')} title="框选需要检测的图片范围">
+              <button className={activeTool === 'roi' ? 'secondary-button active' : 'secondary-button'} disabled={!hasImage || !['repeat_contours', 'smart', 'auto_color_blocks'].includes(mode) || isDetecting} onClick={() => toggleCanvasTool('roi')} title="框选需要检测的图片范围">
                 <SquareDashedMousePointer aria-hidden="true" size={16} />
                 {activeTool === 'roi' ? '取消框选' : '框选范围'}
               </button>
@@ -1193,7 +1265,7 @@ export function App() {
                   return (
                     <g
                       key={detection.id}
-                      className={detection.manual ? 'manual-box' : 'detected-box'}
+                      className={detection.manual ? 'manual-box' : detection.agreement === 'selected_only' ? 'detected-box selected-only-box' : 'detected-box'}
                       style={{ pointerEvents: activeTool === 'target' || activeTool === 'roi' ? 'none' : 'auto' }}
                       onPointerDown={(event) => handleBoxPointerDown(event, detection)}
                       onPointerMove={handleBoxPointerMove}
@@ -1234,6 +1306,10 @@ export function App() {
                     </g>
                   );
                 })}
+                {smartInfo?.alternativeDetections.map((detection) => {
+                  const [x, y, w, h] = detection.bbox;
+                  return <rect key={detection.id} className="alternative-suggestion-box" x={x} y={y} width={w} height={h} rx="6" pointerEvents="none" />;
+                })}
                 {targetReference && (
                   <g className="target-reference" pointerEvents="none">
                     <circle cx={targetReference.x} cy={targetReference.y} r={Math.max(12, Math.min(scaleX, scaleY) * 0.018)} />
@@ -1262,6 +1338,28 @@ export function App() {
             <span>{detections.length}</span>
             <b>个识别区域</b>
           </div>
+          {smartInfo?.strategyDifference && (
+            <div className="difference-review">
+              <div className="difference-heading">
+                <span>策略差异</span>
+                <b>{smartInfo.strategyDifference.matched} 个一致</b>
+              </div>
+              <p>
+                主结果独有 {smartInfo.strategyDifference.selectedOnly} 个，备选结果独有 {smartInfo.strategyDifference.alternativeOnly} 个
+              </p>
+              {smartInfo.alternativeDetections.length > 0 && (
+                <div className="alternative-list">
+                  {smartInfo.alternativeDetections.map((detection, index) => (
+                    <button key={detection.id} onClick={() => adoptAlternativeDetection(detection.id)} title="采用这个备选区域">
+                      <span>备选 #{index + 1}</span>
+                      <small>面积 {Math.round(detection.area)} px</small>
+                      <b>采用</b>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {repeatInfo && repeatInfo.groups.length > 0 && (
             <div className="repeat-group-list" aria-label="候选重复组">
               {repeatInfo.groups.map((group, index) => (
@@ -1318,6 +1416,17 @@ function relabel(items: Detection[]) {
 
 function cloneDetections(items: Detection[]) {
   return items.map((item) => ({ ...item, bbox: [...item.bbox] as Detection['bbox'] }));
+}
+
+function cloneSmartInfo(info: SmartInfo | null) {
+  if (!info) return null;
+  return {
+    ...info,
+    strategyScores: { ...info.strategyScores },
+    alternativeCounts: { ...info.alternativeCounts },
+    alternativeDetections: info.alternativeDetections.map((item) => ({ ...item, bbox: [...item.bbox] as Detection['bbox'] })),
+    strategyDifference: info.strategyDifference ? { ...info.strategyDifference } : null,
+  };
 }
 
 function cloneRegion(region: DetectionRegion | null) {

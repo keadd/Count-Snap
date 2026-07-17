@@ -5,7 +5,12 @@ import unittest
 import cv2
 import numpy as np
 
-from app.detection import _deduplicate_group_detections, detect_repeated_contours, detect_smart_objects
+from app.detection import (
+    _deduplicate_group_detections,
+    detect_auto_color_blocks,
+    detect_repeated_contours,
+    detect_smart_objects,
+)
 
 
 def _make_repeated_parts_image(part_count: int) -> bytes:
@@ -157,6 +162,44 @@ class RepeatedContourDetectionTests(unittest.TestCase):
         self.assertEqual(result["params"]["mode"], "smart")
         self.assertEqual(result["params"]["selectedStrategy"], "repeat_contours")
         self.assertEqual(set(result["strategyScores"]), {"repeat_contours", "auto_color_blocks"})
+
+    def test_auto_color_target_selects_containing_color_family(self) -> None:
+        image = _make_two_groups_image()
+        red_result = detect_auto_color_blocks(image, min_area=600, target_point=(100, 180))
+        blue_result = detect_auto_color_blocks(image, min_area=600, target_point=(760, 150))
+        missed_result = detect_auto_color_blocks(image, min_area=600, target_point=(650, 700))
+
+        self.assertTrue(red_result["targetMatched"])
+        self.assertEqual(red_result["count"], 10)
+        self.assertTrue(blue_result["targetMatched"])
+        self.assertEqual(blue_result["count"], 9)
+        self.assertFalse(missed_result["targetMatched"])
+
+    def test_auto_color_roi_restores_original_coordinates(self) -> None:
+        result = detect_auto_color_blocks(
+            _make_two_groups_image(),
+            min_area=600,
+            roi=(20, 80, 570, 430),
+        )
+
+        self.assertEqual(result["count"], 10)
+        self.assertEqual(result["roi"], {"x": 20, "y": 80, "width": 570, "height": 430})
+        self.assertTrue(all(20 <= detection["bbox"][0] <= 590 for detection in result["detections"]))
+        self.assertTrue(all(80 <= detection["bbox"][1] <= 510 for detection in result["detections"]))
+
+    def test_smart_interactions_compare_both_strategies(self) -> None:
+        result = detect_smart_objects(
+            _make_two_groups_image(),
+            min_area=600,
+            min_repeat=8,
+            target_point=(760, 150),
+        )
+
+        self.assertEqual(set(result["strategyScores"]), {"repeat_contours", "auto_color_blocks"})
+        self.assertEqual(result["strategyDifference"]["matched"], 9)
+        self.assertEqual(result["strategyDifference"]["selectedOnly"], 0)
+        self.assertEqual(result["strategyDifference"]["alternativeOnly"], 0)
+        self.assertTrue(all(detection["agreement"] == "matched" for detection in result["detections"]))
 
 
 if __name__ == "__main__":

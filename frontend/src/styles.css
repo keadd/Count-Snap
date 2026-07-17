@@ -829,6 +829,28 @@ small,
   box-shadow: 0 6px 16px rgba(232, 111, 61, 0.24);
 }
 
+.selected-only-box .draggable-box {
+  fill: rgba(216, 151, 42, 0.16);
+  stroke: #c98212;
+}
+
+.selected-only-box .resize-handle {
+  stroke: #c98212;
+}
+
+.selected-only-box .box-label {
+  background: #a96608;
+  box-shadow: 0 6px 16px rgba(169, 102, 8, 0.24);
+}
+
+.alternative-suggestion-box {
+  fill: rgba(73, 139, 89, 0.08);
+  stroke: #3f8a55;
+  stroke-width: 4px;
+  stroke-dasharray: 12 8;
+  vector-effect: non-scaling-stroke;
+}
+
 .result-heading {
   margin-bottom: 12px;
 }
@@ -884,6 +906,80 @@ small,
   display: grid;
   gap: 7px;
   margin-top: 12px;
+}
+
+.difference-review {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 11px;
+  border: 1px solid rgba(24, 33, 31, 0.12);
+  border-radius: 8px;
+  background: #fbfcf7;
+}
+
+.difference-heading {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.difference-heading span,
+.difference-heading b {
+  font-size: 0.84rem;
+  font-weight: 900;
+}
+
+.difference-heading b {
+  color: #39784a;
+}
+
+.difference-review p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.alternative-list {
+  display: grid;
+  gap: 6px;
+  max-height: 150px;
+  overflow: auto;
+}
+
+.alternative-list button {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px dashed rgba(63, 138, 85, 0.48);
+  border-radius: 7px;
+  background: #ffffff;
+  color: var(--ink);
+  text-align: left;
+}
+
+.alternative-list span {
+  overflow: hidden;
+  font-size: 0.8rem;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alternative-list small {
+  color: var(--muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.alternative-list b {
+  color: #39784a;
+  font-size: 0.76rem;
 }
 
 .repeat-group-option {
@@ -1033,11 +1129,13 @@ small,
   .result-heading,
   .result-score,
   .count-summary,
+  .difference-review,
   .repeat-group-list,
   .detection-list {
     margin: 0;
   }
 
+  .difference-review,
   .repeat-group-list,
   .detection-list {
     grid-column: 1 / -1;
