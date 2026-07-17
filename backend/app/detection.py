@@ -173,6 +173,300 @@ def _score_color_candidate(
     return candidate
 
 
+def _bbox_iou(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> float:
+    left_x1, left_y1, left_w, left_h = left
+    right_x1, right_y1, right_w, right_h = right
+    left_x2 = left_x1 + left_w
+    left_y2 = left_y1 + left_h
+    right_x2 = right_x1 + right_w
+    right_y2 = right_y1 + right_h
+    intersection_w = max(0, min(left_x2, right_x2) - max(left_x1, right_x1))
+    intersection_h = max(0, min(left_y2, right_y2) - max(left_y1, right_y1))
+    intersection = intersection_w * intersection_h
+    union = left_w * left_h + right_w * right_h - intersection
+    return intersection / union if union else 0.0
+
+
+def _repeat_similarity(left: dict, right: dict) -> tuple[float, float]:
+    area_similarity = min(left["area"], right["area"]) / max(left["area"], right["area"])
+    aspect_similarity = float(np.exp(-abs(np.log(left["aspect"] / right["aspect"]))))
+    solidity_similarity = max(0.0, 1.0 - abs(left["solidity"] - right["solidity"]) * 2.2)
+    compactness_similarity = max(0.0, 1.0 - abs(left["compactness"] - right["compactness"]) * 2.5)
+    color_distance = float(np.linalg.norm(left["labColor"] - right["labColor"]))
+    color_similarity = float(np.exp(-((color_distance / 30.0) ** 2)))
+    shape_distance = float(cv2.matchShapes(left["contour"], right["contour"], cv2.CONTOURS_MATCH_I1, 0.0))
+    shape_similarity = float(np.exp(-shape_distance * 3.8))
+    score = (
+        shape_similarity * 0.4
+        + area_similarity * 0.24
+        + color_similarity * 0.18
+        + aspect_similarity * 0.1
+        + solidity_similarity * 0.05
+        + compactness_similarity * 0.03
+    )
+    return score, shape_distance
+
+
+def _extract_repeat_candidates(
+    work: np.ndarray,
+    lab: np.ndarray,
+    centers: np.ndarray,
+    samples: np.ndarray,
+    labels: np.ndarray,
+    scaled_min_area: float,
+) -> list[dict]:
+    work_height, work_width = work.shape[:2]
+    work_area = work_height * work_width
+    flat_lab = lab.reshape(-1, 3)
+    edge_margin = max(3, round(min(work_width, work_height) * 0.01))
+    candidates: list[dict] = []
+
+    for group_index, center in enumerate(centers):
+        assigned = samples[labels == group_index]
+        if len(assigned) == 0:
+            continue
+
+        assigned_distances = np.linalg.norm(assigned - center, axis=1)
+        adaptive_threshold = float(np.percentile(assigned_distances, 80) * 1.35)
+        distance_threshold = float(np.clip(max(12.0, adaptive_threshold), 12.0, 32.0))
+        distance_map = np.linalg.norm(flat_lab - center, axis=1).reshape(work_height, work_width)
+        mask = np.where(distance_map <= distance_threshold, 255, 0).astype(np.uint8)
+
+        kernel = np.ones((3, 3), np.uint8)
+        cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < max(30.0, scaled_min_area * 0.42) or area > work_area * 0.09:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            if w < 7 or h < 7:
+                continue
+
+            aspect = max(w / max(1, h), h / max(1, w))
+            bbox_area = max(1, w * h)
+            extent = area / bbox_area
+            hull = cv2.convexHull(contour)
+            hull_area = max(1.0, float(cv2.contourArea(hull)))
+            solidity = area / hull_area
+            perimeter = max(1.0, float(cv2.arcLength(contour, True)))
+            compactness = float(4.0 * np.pi * area / (perimeter * perimeter))
+            touches_edge = (
+                x <= edge_margin
+                or y <= edge_margin
+                or x + w >= work_width - edge_margin
+                or y + h >= work_height - edge_margin
+            )
+            if aspect > 4.8 or extent < 0.16 or solidity < 0.34:
+                continue
+            if touches_edge and area > work_area * 0.018:
+                continue
+
+            candidates.append(
+                {
+                    "contour": contour,
+                    "bbox": (x, y, w, h),
+                    "area": area,
+                    "aspect": aspect,
+                    "extent": extent,
+                    "solidity": solidity,
+                    "compactness": compactness,
+                    "labColor": center.astype(float),
+                    "touchesEdge": touches_edge,
+                }
+            )
+
+    candidates.sort(key=lambda item: (item["area"], item["solidity"] + item["extent"]), reverse=True)
+    deduplicated: list[dict] = []
+    for candidate in candidates:
+        if any(_bbox_iou(candidate["bbox"], kept["bbox"]) >= 0.58 for kept in deduplicated):
+            continue
+        deduplicated.append(candidate)
+        if len(deduplicated) >= 240:
+            break
+
+    for index, candidate in enumerate(deduplicated):
+        candidate["index"] = index
+    return deduplicated
+
+
+def _build_repeat_groups(candidates: list[dict], scale: float) -> list[dict]:
+    if len(candidates) < 2:
+        return []
+
+    adjacency = [set([index]) for index in range(len(candidates))]
+    similarities: dict[tuple[int, int], float] = {}
+    for left_index in range(len(candidates)):
+        for right_index in range(left_index + 1, len(candidates)):
+            similarity, shape_distance = _repeat_similarity(candidates[left_index], candidates[right_index])
+            similarities[(left_index, right_index)] = similarity
+            area_ratio = min(candidates[left_index]["area"], candidates[right_index]["area"]) / max(
+                candidates[left_index]["area"], candidates[right_index]["area"]
+            )
+            color_distance = float(
+                np.linalg.norm(candidates[left_index]["labColor"] - candidates[right_index]["labColor"])
+            )
+            if similarity >= 0.64 and area_ratio >= 0.48 and shape_distance <= 0.58 and color_distance <= 42.0:
+                adjacency[left_index].add(right_index)
+                adjacency[right_index].add(left_index)
+
+    components: list[list[int]] = []
+    remaining = set(range(len(candidates)))
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        component = [start]
+        while stack:
+            current = stack.pop()
+            for neighbor in adjacency[current]:
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    component.append(neighbor)
+                    stack.append(neighbor)
+        if len(component) >= 2:
+            components.append(component)
+
+    groups = []
+    seen_members: set[tuple[int, ...]] = set()
+    for component in components:
+        def average_similarity(candidate_index: int) -> float:
+            values = []
+            for other_index in component:
+                if candidate_index == other_index:
+                    continue
+                key = tuple(sorted((candidate_index, other_index)))
+                values.append(similarities.get(key, 0.0))
+            return float(np.mean(values)) if values else 1.0
+
+        medoid_index = max(component, key=average_similarity)
+        members = []
+        member_similarities = []
+        for candidate_index in component:
+            if candidate_index == medoid_index:
+                similarity = 1.0
+            else:
+                key = tuple(sorted((medoid_index, candidate_index)))
+                similarity = similarities.get(key, 0.0)
+            if similarity >= 0.6:
+                members.append(candidate_index)
+                member_similarities.append(similarity)
+
+        member_key = tuple(sorted(members))
+        if len(members) < 2 or member_key in seen_members:
+            continue
+        seen_members.add(member_key)
+
+        member_candidates = [candidates[index] for index in members]
+        areas = np.array([candidate["area"] for candidate in member_candidates], dtype=float)
+        median_area = float(np.median(areas))
+        area_cv = float(np.std(areas) / median_area) if median_area else 2.0
+        mean_similarity = float(np.mean(member_similarities)) if member_similarities else 0.0
+        edge_ratio = sum(1 for candidate in member_candidates if candidate["touchesEdge"]) / len(member_candidates)
+        median_lab = np.median(np.array([candidate["labColor"] for candidate in member_candidates]), axis=0)
+        rgb, hex_color = _lab_center_to_rgb(median_lab)
+        score = len(members) * 5.0 + mean_similarity * 22.0 + 10.0 / (1.0 + area_cv * 4.0) - edge_ratio * 5.0
+        groups.append(
+            {
+                "members": members,
+                "count": len(members),
+                "score": round(float(score), 3),
+                "meanSimilarity": round(mean_similarity, 3),
+                "medianArea": round(median_area / (scale * scale), 2),
+                "areaCv": round(area_cv, 3),
+                "color": {"rgb": rgb, "hex": hex_color},
+            }
+        )
+
+    groups.sort(key=lambda item: (item["count"], item["score"]), reverse=True)
+    return groups
+
+
+def detect_repeated_contours(
+    image_bytes: bytes,
+    min_area: int = 900,
+    min_repeat: int = 8,
+    cluster_count: int = 10,
+) -> dict:
+    _, work, scale, width, height = _decode_work_image(image_bytes)
+    work_height, work_width = work.shape[:2]
+    lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    margin_x = round(work_width * 0.08)
+    margin_y = round(work_height * 0.08)
+    center_crop = lab[margin_y : work_height - margin_y, margin_x : work_width - margin_x]
+    if center_crop.size == 0:
+        center_crop = lab
+
+    samples = center_crop.reshape(-1, 3)
+    max_samples = 80000
+    if len(samples) > max_samples:
+        step = max(1, len(samples) // max_samples)
+        samples = samples[::step][:max_samples]
+
+    min_repeat = int(np.clip(min_repeat, 2, 50))
+    if len(samples) < 20:
+        return {
+            "count": 0,
+            "imageWidth": width,
+            "imageHeight": height,
+            "detections": [],
+            "selectedRepeatGroup": None,
+            "repeatGroups": [],
+            "params": {"mode": "repeat_contours", "minArea": min_area, "minRepeat": min_repeat},
+        }
+
+    k = max(3, min(cluster_count, len(samples)))
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 28, 0.75)
+    cv2.setRNGSeed(12345)
+    _, labels, centers = cv2.kmeans(samples, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+    labels = labels.reshape(-1)
+    scaled_min_area = max(45.0, min_area * scale * scale)
+    candidates = _extract_repeat_candidates(work, lab, centers, samples, labels, scaled_min_area)
+    groups = _build_repeat_groups(candidates, scale)
+    selected_group = next((group for group in groups if group["count"] >= min_repeat), None)
+
+    detections = []
+    if selected_group:
+        for candidate_index in selected_group["members"]:
+            candidate = candidates[candidate_index]
+            x, y, w, h = candidate["bbox"]
+            detections.append(
+                {
+                    "id": f"repeat_{uuid.uuid4().hex[:8]}",
+                    "bbox": [round(x / scale), round(y / scale), round(w / scale), round(h / scale)],
+                    "area": round(candidate["area"] / (scale * scale), 2),
+                    "count": 1,
+                }
+            )
+
+    detections.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+    for index, detection in enumerate(detections, start=1):
+        detection["label"] = str(index)
+
+    public_groups = [{key: value for key, value in group.items() if key != "members"} for group in groups[:8]]
+    public_selected_group = (
+        {key: value for key, value in selected_group.items() if key != "members"} if selected_group else None
+    )
+    return {
+        "count": len(detections),
+        "imageWidth": width,
+        "imageHeight": height,
+        "detections": detections,
+        "selectedRepeatGroup": public_selected_group,
+        "repeatGroups": public_groups,
+        "candidateCount": len(candidates),
+        "params": {
+            "mode": "repeat_contours",
+            "minArea": min_area,
+            "minRepeat": min_repeat,
+            "clusterCount": cluster_count,
+        },
+    }
+
+
 def detect_objects(
     image_bytes: bytes,
     min_area: int = 900,

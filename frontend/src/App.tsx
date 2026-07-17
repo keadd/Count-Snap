@@ -38,6 +38,9 @@ type DetectResponse = {
   selectedColor?: AutoColorInfo['selectedColor'] | null;
   selectedScore?: number;
   candidateColorGroups?: AutoColorCandidate[];
+  selectedRepeatGroup?: RepeatGroup | null;
+  repeatGroups?: RepeatGroup[];
+  candidateCount?: number;
   params: {
     mode?: string;
     minArea: number;
@@ -45,7 +48,26 @@ type DetectResponse = {
     blur?: number;
     invert?: boolean;
     clusterCount?: number;
+    minRepeat?: number;
   };
+};
+
+type RepeatGroup = {
+  count: number;
+  score: number;
+  meanSimilarity: number;
+  medianArea: number;
+  areaCv: number;
+  color: {
+    rgb: [number, number, number] | number[];
+    hex: string;
+  };
+};
+
+type RepeatInfo = {
+  selectedGroup: RepeatGroup | null;
+  groups: RepeatGroup[];
+  candidateCount: number;
 };
 
 type AutoColorCandidate = {
@@ -80,6 +102,7 @@ type AutoColorInfo = {
 const defaultMinArea = 900;
 const defaultBlur = 7;
 const detectionModes = [
+  { value: 'repeat_contours', label: '重复轮廓' },
   { value: 'auto_color_blocks', label: '自动纯色检测' },
   { value: 'basic', label: '基础轮廓检测' },
 ] as const;
@@ -91,11 +114,13 @@ export function App() {
   const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
   const [detections, setDetections] = useState<Detection[]>([]);
   const [minArea, setMinArea] = useState(defaultMinArea);
+  const [minRepeat, setMinRepeat] = useState(8);
   const [threshold, setThreshold] = useState(0);
   const [blur, setBlur] = useState(defaultBlur);
   const [invert, setInvert] = useState(true);
-  const [mode, setMode] = useState<(typeof detectionModes)[number]['value']>('auto_color_blocks');
+  const [mode, setMode] = useState<(typeof detectionModes)[number]['value']>('repeat_contours');
   const [autoColorInfo, setAutoColorInfo] = useState<AutoColorInfo | null>(null);
+  const [repeatInfo, setRepeatInfo] = useState<RepeatInfo | null>(null);
   const [addMode, setAddMode] = useState(false);
   const [isDetecting, setIsDetecting] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
@@ -135,6 +160,7 @@ export function App() {
     setImageSize({ width: 0, height: 0 });
     setDetections([]);
     setAutoColorInfo(null);
+    setRepeatInfo(null);
     setMessage('照片已载入，可以开始检测。');
   }
 
@@ -178,10 +204,12 @@ export function App() {
     }
 
     const uploadFile = await prepareImageForDetection(file);
+    const requestedMinRepeat = Math.min(50, Math.max(2, Math.floor(minRepeat || 8)));
     const form = new FormData();
     form.append('image', uploadFile);
     form.append('mode', mode);
     form.append('min_area', String(minArea));
+    form.append('min_repeat', String(requestedMinRepeat));
     form.append('threshold', String(threshold));
     form.append('blur', String(blur));
     form.append('invert', String(invert));
@@ -216,9 +244,25 @@ export function App() {
             }
           : null;
       setAutoColorInfo(nextAutoColorInfo);
+      const nextRepeatInfo =
+        data.params.mode === 'repeat_contours'
+          ? {
+              selectedGroup: data.selectedRepeatGroup ?? null,
+              groups: data.repeatGroups ?? [],
+              candidateCount: data.candidateCount ?? 0,
+            }
+          : null;
+      setRepeatInfo(nextRepeatInfo);
       const nextTotal = nextDetections.reduce((sum, detection) => sum + detection.count, 0);
       const colorSuffix = nextAutoColorInfo?.selectedColor ? `自动目标色 ${nextAutoColorInfo.selectedColor.hex}。` : '';
-      setMessage(`已识别 ${nextDetections.length} 个区域，当前总数为 ${nextTotal}。${colorSuffix}如果一个框里有多个物体，可以手动修改数量。`);
+      const repeatSuffix = nextRepeatInfo?.selectedGroup
+        ? `重复组相似度 ${Math.round(nextRepeatInfo.selectedGroup.meanSimilarity * 100)}%。`
+        : '';
+      if (data.params.mode === 'repeat_contours' && !nextRepeatInfo?.selectedGroup) {
+        setMessage(`找到了 ${nextRepeatInfo?.candidateCount ?? 0} 个候选色块，但没有形成至少 ${requestedMinRepeat} 个相似轮廓的重复组。可以降低最低重复数量或最小面积后重试。`);
+      } else {
+        setMessage(`已识别 ${nextDetections.length} 个区域，当前总数为 ${nextTotal}。${colorSuffix}${repeatSuffix}如果一个框里有多个物体，可以手动修改数量。`);
+      }
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
         setMessage('检测超时。可以换一张更小的照片，或调高最小面积后再试。');
@@ -570,23 +614,50 @@ export function App() {
                 </small>
               </div>
             )}
+            {mode === 'repeat_contours' && (
+              <div className="wide-field auto-color-card">
+                <span>重复轮廓组</span>
+                <div className="auto-color-preview">
+                  <i style={{ backgroundColor: repeatInfo?.selectedGroup?.color.hex ?? '#ffffff' }} />
+                  <b>{repeatInfo?.selectedGroup ? `${repeatInfo.selectedGroup.count} 个相似区域` : '等待检测'}</b>
+                  {repeatInfo?.selectedGroup && <small>相似 {Math.round(repeatInfo.selectedGroup.meanSimilarity * 100)}%</small>}
+                </div>
+                <small>
+                  {repeatInfo
+                    ? repeatInfo.selectedGroup
+                      ? `从 ${repeatInfo.candidateCount} 个候选色块中找到 ${repeatInfo.groups.length} 个重复组。`
+                      : `${repeatInfo.candidateCount} 个候选色块，没有达到最低重复数量。`
+                    : '会比较色块的轮廓、面积、颜色和长宽比，寻找大量重复出现的零件。'}
+                </small>
+              </div>
+            )}
             <label>
               最小面积
               <input type="number" min="10" step="50" value={minArea} onChange={(event) => setMinArea(Number(event.target.value))} />
             </label>
-            <label className="wide-field">
-              阈值
-              <input type="number" min="0" max="255" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} />
-              <small>填 0 会使用自动阈值。</small>
-            </label>
-            <label>
-              模糊半径
-              <input type="number" min="3" max="31" step="2" value={blur} onChange={(event) => setBlur(Number(event.target.value))} />
-            </label>
-            <label className="toggle-row">
-              <input type="checkbox" checked={invert} onChange={(event) => setInvert(event.target.checked)} />
-              反转前景
-            </label>
+            {mode === 'repeat_contours' && (
+              <label>
+                最低重复数量
+                <input type="number" min="2" max="50" value={minRepeat} onChange={(event) => setMinRepeat(Number(event.target.value))} />
+              </label>
+            )}
+            {mode === 'basic' && (
+              <>
+                <label className="wide-field">
+                  阈值
+                  <input type="number" min="0" max="255" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} />
+                  <small>填 0 会使用自动阈值。</small>
+                </label>
+                <label>
+                  模糊半径
+                  <input type="number" min="3" max="31" step="2" value={blur} onChange={(event) => setBlur(Number(event.target.value))} />
+                </label>
+                <label className="toggle-row">
+                  <input type="checkbox" checked={invert} onChange={(event) => setInvert(event.target.checked)} />
+                  反转前景
+                </label>
+              </>
+            )}
           </div>
 
           <div className="action-stack">

@@ -3,9 +3,9 @@
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from .detection import detect_auto_color_blocks, detect_objects
+from .detection import detect_auto_color_blocks, detect_objects, detect_repeated_contours
 
-app = FastAPI(title="CountSnap API", version="0.1.0")
+app = FastAPI(title="CountSnap API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,8 +24,9 @@ def health() -> dict[str, str]:
 @app.post("/api/detect")
 async def detect(
     image: UploadFile = File(...),
-    mode: str = Form("color"),
+    mode: str = Form("repeat_contours"),
     min_area: int = Form(900),
+    min_repeat: int = Form(8),
     threshold: int = Form(0),
     blur: int = Form(7),
     invert: bool = Form(True),
@@ -38,6 +39,13 @@ async def detect(
         raise HTTPException(status_code=400, detail="上传的图片是空文件。")
 
     try:
+        if mode == "repeat_contours":
+            return detect_repeated_contours(
+                image_bytes=image_bytes,
+                min_area=min_area,
+                min_repeat=min_repeat,
+            )
+
         if mode in {"auto_color_blocks", "color"}:
             return detect_auto_color_blocks(
                 image_bytes=image_bytes,
