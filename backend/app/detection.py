@@ -187,6 +187,32 @@ def _bbox_iou(left: tuple[int, int, int, int], right: tuple[int, int, int, int])
     return intersection / union if union else 0.0
 
 
+def _bbox_containment(left: tuple[int, int, int, int], right: tuple[int, int, int, int]) -> float:
+    left_x1, left_y1, left_w, left_h = left
+    right_x1, right_y1, right_w, right_h = right
+    left_x2 = left_x1 + left_w
+    left_y2 = left_y1 + left_h
+    right_x2 = right_x1 + right_w
+    right_y2 = right_y1 + right_h
+    intersection_w = max(0, min(left_x2, right_x2) - max(left_x1, right_x1))
+    intersection_h = max(0, min(left_y2, right_y2) - max(left_y1, right_y1))
+    intersection = intersection_w * intersection_h
+    smaller_area = min(left_w * left_h, right_w * right_h)
+    return intersection / smaller_area if smaller_area else 0.0
+
+
+def _are_repeat_candidates_duplicate(left: dict, right: dict) -> bool:
+    if _bbox_iou(left["bbox"], right["bbox"]) >= 0.58:
+        return True
+    if _bbox_containment(left["bbox"], right["bbox"]) < 0.82:
+        return False
+
+    area_ratio = min(left["area"], right["area"]) / max(left["area"], right["area"])
+    color_distance = float(np.linalg.norm(left["labColor"] - right["labColor"]))
+    shape_distance = float(cv2.matchShapes(left["contour"], right["contour"], cv2.CONTOURS_MATCH_I1, 0.0))
+    return area_ratio >= 0.42 and color_distance <= 50.0 and shape_distance <= 0.72
+
+
 def _repeat_similarity(left: dict, right: dict) -> tuple[float, float]:
     area_similarity = min(left["area"], right["area"]) / max(left["area"], right["area"])
     aspect_similarity = float(np.exp(-abs(np.log(left["aspect"] / right["aspect"]))))
@@ -282,7 +308,7 @@ def _extract_repeat_candidates(
     candidates.sort(key=lambda item: (item["area"], item["solidity"] + item["extent"]), reverse=True)
     deduplicated: list[dict] = []
     for candidate in candidates:
-        if any(_bbox_iou(candidate["bbox"], kept["bbox"]) >= 0.58 for kept in deduplicated):
+        if any(_are_repeat_candidates_duplicate(candidate, kept) for kept in deduplicated):
             continue
         deduplicated.append(candidate)
         if len(deduplicated) >= 240:

@@ -54,6 +54,21 @@ def _make_two_groups_image() -> bytes:
     return buffer.tobytes()
 
 
+def _make_nested_color_parts_image() -> bytes:
+    image = np.full((700, 1000, 3), 238, dtype=np.uint8)
+    for index in range(8):
+        row, column = divmod(index, 4)
+        center_x = 100 + column * 210
+        center_y = 170 + row * 270
+        cv2.rectangle(image, (center_x - 48, center_y - 48), (center_x + 48, center_y + 48), (45, 55, 220), -1)
+        cv2.rectangle(image, (center_x - 36, center_y - 36), (center_x + 36, center_y + 36), (55, 66, 195), -1)
+
+    encoded, buffer = cv2.imencode(".png", image)
+    if not encoded:
+        raise RuntimeError("Could not encode synthetic nested-color image.")
+    return buffer.tobytes()
+
+
 class RepeatedContourDetectionTests(unittest.TestCase):
     def test_counts_repeated_irregular_parts(self) -> None:
         result = detect_repeated_contours(
@@ -108,6 +123,17 @@ class RepeatedContourDetectionTests(unittest.TestCase):
         self.assertEqual(result["count"], 10)
         self.assertEqual(len(result["repeatGroups"]), 1)
         self.assertEqual(result["roi"], {"x": 20, "y": 80, "width": 570, "height": 430})
+
+    def test_removes_nested_boxes_from_same_part(self) -> None:
+        result = detect_repeated_contours(
+            _make_nested_color_parts_image(),
+            min_area=800,
+            min_repeat=8,
+        )
+
+        self.assertEqual(result["candidateCount"], 8)
+        self.assertEqual(result["count"], 8)
+        self.assertEqual(result["repeatGroups"][0]["count"], 8)
 
 
 if __name__ == "__main__":
