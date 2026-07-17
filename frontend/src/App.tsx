@@ -1,5 +1,7 @@
 ﻿import { ChangeEvent, MouseEvent, useEffect, useRef, useState } from 'react';
 
+import { Crosshair, Download, Plus, Redo2, RotateCcw, ScanSearch, SquareDashedMousePointer, Trash2, Undo2 } from 'lucide-react';
+
 import type { DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent } from 'react';
 
 type Detection = {
@@ -28,7 +30,30 @@ type DragState = {
   width: number;
   height: number;
   moved: boolean;
+  beforeSnapshot: EditorSnapshot;
 };
+
+type DetectionRegion = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type EditorSnapshot = {
+  detections: Detection[];
+  selectedGroupId: string | null;
+  detectionRegion: DetectionRegion | null;
+};
+
+type RoiDragState = {
+  startX: number;
+  startY: number;
+  moved: boolean;
+  beforeSnapshot: EditorSnapshot;
+};
+
+type CanvasTool = 'add' | 'target' | 'roi' | null;
 
 type DetectResponse = {
   count: number;
@@ -39,8 +64,11 @@ type DetectResponse = {
   selectedScore?: number;
   candidateColorGroups?: AutoColorCandidate[];
   selectedRepeatGroup?: RepeatGroup | null;
+  selectedGroupId?: string | null;
   repeatGroups?: RepeatGroup[];
   candidateCount?: number;
+  targetMatched?: boolean;
+  roi?: DetectionRegion | null;
   params: {
     mode?: string;
     minArea: number;
@@ -53,6 +81,7 @@ type DetectResponse = {
 };
 
 type RepeatGroup = {
+  id: string;
   count: number;
   score: number;
   meanSimilarity: number;
@@ -62,9 +91,13 @@ type RepeatGroup = {
     rgb: [number, number, number] | number[];
     hex: string;
   };
+  meetsMinimum: boolean;
+  detections: ApiDetection[];
+  selectionMethod?: 'automatic' | 'target_point';
 };
 
 type RepeatInfo = {
+  selectedGroupId: string | null;
   selectedGroup: RepeatGroup | null;
   groups: RepeatGroup[];
   candidateCount: number;
@@ -121,14 +154,23 @@ export function App() {
   const [mode, setMode] = useState<(typeof detectionModes)[number]['value']>('repeat_contours');
   const [autoColorInfo, setAutoColorInfo] = useState<AutoColorInfo | null>(null);
   const [repeatInfo, setRepeatInfo] = useState<RepeatInfo | null>(null);
-  const [addMode, setAddMode] = useState(false);
+  const [activeTool, setActiveTool] = useState<CanvasTool>(null);
+  const [detectionRegion, setDetectionRegion] = useState<DetectionRegion | null>(null);
+  const [roiDraft, setRoiDraft] = useState<DetectionRegion | null>(null);
+  const [targetReference, setTargetReference] = useState<{ x: number; y: number } | null>(null);
+  const [historyPast, setHistoryPast] = useState<EditorSnapshot[]>([]);
+  const [historyFuture, setHistoryFuture] = useState<EditorSnapshot[]>([]);
   const [isDetecting, setIsDetecting] = useState(false);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [isMobileReview, setIsMobileReview] = useState(false);
   const [message, setMessage] = useState('请上传一张物体分开、背景尽量干净的照片。');
   const imageRef = useRef<HTMLImageElement | null>(null);
   const dragStateRef = useRef<DragState | null>(null);
+  const roiDragStateRef = useRef<RoiDragState | null>(null);
   const suppressNextBoxClickRef = useRef(false);
+  const suppressNextCanvasClickRef = useRef(false);
+  const automaticDetectionsRef = useRef<Record<string, Detection[]>>({});
+  const automaticGroupIdRef = useRef<string | null>(null);
 
   const totalCount = detections.reduce((sum, detection) => sum + detection.count, 0);
 
@@ -142,10 +184,75 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (isMobileReview) {
-      setAddMode(false);
+    if (isMobileReview && activeTool === 'add') {
+      setActiveTool(null);
     }
-  }, [isMobileReview]);
+  }, [activeTool, isMobileReview]);
+
+  useEffect(() => {
+    function handleHistoryShortcut(event: KeyboardEvent) {
+      if (!event.ctrlKey && !event.metaKey) return;
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement || event.target instanceof HTMLTextAreaElement) return;
+
+      const key = event.key.toLowerCase();
+      if (key === 'z' && !event.shiftKey) {
+        event.preventDefault();
+        undoEdit();
+      } else if (key === 'y' || (key === 'z' && event.shiftKey)) {
+        event.preventDefault();
+        redoEdit();
+      }
+    }
+
+    window.addEventListener('keydown', handleHistoryShortcut);
+    return () => window.removeEventListener('keydown', handleHistoryShortcut);
+  });
+
+  function createSnapshot(): EditorSnapshot {
+    return {
+      detections: cloneDetections(detections),
+      selectedGroupId: repeatInfo?.selectedGroupId ?? null,
+      detectionRegion: cloneRegion(detectionRegion),
+    };
+  }
+
+  function pushHistory(snapshot: EditorSnapshot = createSnapshot()) {
+    setHistoryPast((current) => [...current.slice(-49), snapshot]);
+    setHistoryFuture([]);
+  }
+
+  function applySnapshot(snapshot: EditorSnapshot) {
+    setDetections(cloneDetections(snapshot.detections));
+    setDetectionRegion(cloneRegion(snapshot.detectionRegion));
+    setRepeatInfo((current) => {
+      if (!current) return current;
+      const selectedGroup = current.groups.find((group) => group.id === snapshot.selectedGroupId) ?? null;
+      return { ...current, selectedGroupId: snapshot.selectedGroupId, selectedGroup };
+    });
+    setActiveTool(null);
+    setRoiDraft(null);
+    setTargetReference(null);
+  }
+
+  function undoEdit() {
+    if (!historyPast.length) return;
+    const previous = historyPast[historyPast.length - 1];
+    const currentSnapshot = createSnapshot();
+    setHistoryPast((current) => current.slice(0, -1));
+    setHistoryFuture((current) => [currentSnapshot, ...current].slice(0, 50));
+    applySnapshot(previous);
+    setMessage('已撤销上一步操作。');
+  }
+
+  function redoEdit() {
+    if (!historyFuture.length) return;
+    const next = historyFuture[0];
+    const currentSnapshot = createSnapshot();
+    setHistoryFuture((current) => current.slice(1));
+    setHistoryPast((current) => [...current.slice(-49), currentSnapshot]);
+    applySnapshot(next);
+    setMessage('已重做上一步操作。');
+  }
 
   function loadImageFile(nextFile: File) {
     if (!nextFile.type.startsWith('image/')) {
@@ -161,6 +268,14 @@ export function App() {
     setDetections([]);
     setAutoColorInfo(null);
     setRepeatInfo(null);
+    setActiveTool(null);
+    setDetectionRegion(null);
+    setRoiDraft(null);
+    setTargetReference(null);
+    setHistoryPast([]);
+    setHistoryFuture([]);
+    automaticDetectionsRef.current = {};
+    automaticGroupIdRef.current = null;
     setMessage('照片已载入，可以开始检测。');
   }
 
@@ -197,13 +312,13 @@ export function App() {
     loadImageFile(nextFile);
   }
 
-  async function runDetection() {
+  async function runDetection(options: { targetPoint?: { x: number; y: number } } = {}) {
     if (!file) {
       setMessage('请先选择或拍摄一张照片。');
       return;
     }
 
-    const uploadFile = await prepareImageForDetection(file);
+    const uploadFile = mode === 'repeat_contours' ? file : await prepareImageForDetection(file);
     const requestedMinRepeat = Math.min(50, Math.max(2, Math.floor(minRepeat || 8)));
     const form = new FormData();
     form.append('image', uploadFile);
@@ -213,6 +328,16 @@ export function App() {
     form.append('threshold', String(threshold));
     form.append('blur', String(blur));
     form.append('invert', String(invert));
+    if (options.targetPoint) {
+      form.append('target_x', String(options.targetPoint.x));
+      form.append('target_y', String(options.targetPoint.y));
+    }
+    if (detectionRegion && mode === 'repeat_contours') {
+      form.append('roi_x', String(detectionRegion.x));
+      form.append('roi_y', String(detectionRegion.y));
+      form.append('roi_width', String(detectionRegion.width));
+      form.append('roi_height', String(detectionRegion.height));
+    }
 
     setIsDetecting(true);
     setMessage('正在识别物体，请稍等...');
@@ -232,9 +357,32 @@ export function App() {
         throw new Error(error?.detail ?? '检测失败，请稍后再试。');
       }
       const data = (await response.json()) as DetectResponse;
-      const nextDetections = relabel(data.detections.map((detection) => ({ ...detection, count: detection.count ?? 1 })));
+      if (options.targetPoint && data.targetMatched === false) {
+        setMessage('点击位置附近没有找到可用色块，请点击一个完整零件后重试。');
+        return;
+      }
+
+      const nextGroups = (data.repeatGroups ?? []).map((group) => ({
+        ...group,
+        detections: relabel(group.detections.map((detection) => ({ ...detection, count: detection.count ?? 1 }))),
+      }));
+      const nextSelectedGroupId = data.selectedGroupId ?? null;
+      const nextSelectedGroup = nextGroups.find((group) => group.id === nextSelectedGroupId) ?? null;
+      const nextDetections = nextSelectedGroup
+        ? cloneDetections(nextSelectedGroup.detections as Detection[])
+        : relabel(data.detections.map((detection) => ({ ...detection, count: detection.count ?? 1 })));
+
+      if (options.targetPoint) {
+        pushHistory();
+      } else {
+        setHistoryPast([]);
+        setHistoryFuture([]);
+      }
       setImageSize({ width: data.imageWidth, height: data.imageHeight });
       setDetections(nextDetections);
+      setActiveTool(null);
+      setTargetReference(options.targetPoint ?? null);
+      if (data.roi !== undefined) setDetectionRegion(cloneRegion(data.roi ?? null));
       const nextAutoColorInfo =
         data.params.mode === 'auto_color_blocks'
           ? {
@@ -247,12 +395,17 @@ export function App() {
       const nextRepeatInfo =
         data.params.mode === 'repeat_contours'
           ? {
-              selectedGroup: data.selectedRepeatGroup ?? null,
-              groups: data.repeatGroups ?? [],
+              selectedGroupId: nextSelectedGroupId,
+              selectedGroup: nextSelectedGroup,
+              groups: nextGroups,
               candidateCount: data.candidateCount ?? 0,
             }
           : null;
       setRepeatInfo(nextRepeatInfo);
+      automaticDetectionsRef.current = Object.fromEntries(
+        nextGroups.map((group) => [group.id, cloneDetections(group.detections as Detection[])]),
+      );
+      if (!options.targetPoint) automaticGroupIdRef.current = nextSelectedGroupId;
       const nextTotal = nextDetections.reduce((sum, detection) => sum + detection.count, 0);
       const colorSuffix = nextAutoColorInfo?.selectedColor ? `自动目标色 ${nextAutoColorInfo.selectedColor.hex}。` : '';
       const repeatSuffix = nextRepeatInfo?.selectedGroup
@@ -274,12 +427,80 @@ export function App() {
     }
   }
 
+  function selectRepeatGroup(groupId: string) {
+    if (!repeatInfo || groupId === repeatInfo.selectedGroupId) return;
+    const targetGroup = repeatInfo.groups.find((group) => group.id === groupId);
+    if (!targetGroup) return;
+
+    pushHistory();
+    const nextGroups = repeatInfo.groups.map((group) =>
+      group.id === repeatInfo.selectedGroupId ? { ...group, detections: cloneDetections(detections) } : group,
+    );
+    const nextTarget = nextGroups.find((group) => group.id === groupId) ?? targetGroup;
+    setRepeatInfo({ ...repeatInfo, groups: nextGroups, selectedGroupId: groupId, selectedGroup: nextTarget });
+    setDetections(cloneDetections(nextTarget.detections as Detection[]));
+    setTargetReference(null);
+    setActiveTool(null);
+    setMessage(`已切换到候选组，共 ${nextTarget.count} 个相似区域。`);
+  }
+
+  function restoreAutomaticResult() {
+    if (!repeatInfo) return;
+    const automaticGroupId = automaticGroupIdRef.current;
+    const groupId = automaticGroupId && repeatInfo.groups.some((group) => group.id === automaticGroupId)
+      ? automaticGroupId
+      : repeatInfo.selectedGroupId;
+    if (!groupId) return;
+    const baseline = automaticDetectionsRef.current[groupId];
+    if (!baseline) return;
+
+    pushHistory();
+    setDetections(cloneDetections(baseline));
+    const selectedGroup = repeatInfo.groups.find((group) => group.id === groupId) ?? null;
+    setRepeatInfo({ ...repeatInfo, selectedGroupId: groupId, selectedGroup });
+    setTargetReference(null);
+    setMessage(groupId === repeatInfo.selectedGroupId ? '已恢复当前候选组的自动检测结果。' : '已恢复程序最初选择的候选组。');
+  }
+
+  function toggleCanvasTool(tool: Exclude<CanvasTool, null>) {
+    const nextTool = activeTool === tool ? null : tool;
+    setActiveTool(nextTool);
+    setRoiDraft(null);
+    if (nextTool === null) {
+      setMessage('已退出画布工具。');
+    } else if (nextTool === 'target') {
+      setMessage('请点击一个需要统计的目标零件。');
+    } else if (nextTool === 'roi') {
+      setMessage('请在图片上拖动，框选需要检测的区域。');
+    } else {
+      setMessage('请点击图片，手动添加识别区域。');
+    }
+  }
+
+  function changeDetectionMode(nextMode: (typeof detectionModes)[number]['value']) {
+    setMode(nextMode);
+    setActiveTool(null);
+    setRoiDraft(null);
+  }
+
+  function clearDetectionRegion() {
+    if (!detectionRegion) return;
+    pushHistory();
+    setDetectionRegion(null);
+    setRoiDraft(null);
+    setMessage('已清除检测范围，下次检测将分析整张图片。');
+  }
+
   function removeDetection(id: string) {
+    if (!detections.some((item) => item.id === id)) return;
+    pushHistory();
     setDetections((current) => relabel(current.filter((item) => item.id !== id)));
   }
 
   function updateDetectionCount(id: string, count: number) {
     const safeCount = Math.max(1, Math.floor(count || 1));
+    if (detections.find((item) => item.id === id)?.count === safeCount) return;
+    pushHistory();
     setDetections((current) => current.map((item) => (item.id === id ? { ...item, count: safeCount } : item)));
   }
 
@@ -354,8 +575,97 @@ export function App() {
     };
   }
 
+  function handleOverlayPointerDown(event: ReactPointerEvent<SVGSVGElement>) {
+    if (activeTool !== 'roi') return;
+    const point = getImagePoint(event.clientX, event.clientY);
+    if (!point) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    const startX = clamp(point.x, 0, imageSize.width);
+    const startY = clamp(point.y, 0, imageSize.height);
+    roiDragStateRef.current = {
+      startX,
+      startY,
+      moved: false,
+      beforeSnapshot: createSnapshot(),
+    };
+    setRoiDraft({ x: startX, y: startY, width: 0, height: 0 });
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handleOverlayPointerMove(event: ReactPointerEvent<SVGSVGElement>) {
+    const roiDrag = roiDragStateRef.current;
+    if (!roiDrag || activeTool !== 'roi') return;
+    const point = getImagePoint(event.clientX, event.clientY);
+    if (!point) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    const nextRegion = regionFromPoints(
+      roiDrag.startX,
+      roiDrag.startY,
+      clamp(point.x, 0, imageSize.width),
+      clamp(point.y, 0, imageSize.height),
+    );
+    roiDrag.moved = nextRegion.width > 4 || nextRegion.height > 4;
+    setRoiDraft(nextRegion);
+  }
+
+  function handleOverlayPointerUp(event: ReactPointerEvent<SVGSVGElement>) {
+    const roiDrag = roiDragStateRef.current;
+    if (!roiDrag || activeTool !== 'roi') return;
+    const point = getImagePoint(event.clientX, event.clientY);
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    if (point) {
+      const nextRegion = roundRegion(
+        regionFromPoints(
+          roiDrag.startX,
+          roiDrag.startY,
+          clamp(point.x, 0, imageSize.width),
+          clamp(point.y, 0, imageSize.height),
+        ),
+      );
+      const minimumSize = Math.max(24, Math.min(imageSize.width, imageSize.height) * 0.04);
+      if (nextRegion.width >= minimumSize && nextRegion.height >= minimumSize) {
+        pushHistory(roiDrag.beforeSnapshot);
+        setDetectionRegion(nextRegion);
+        setMessage('检测范围已设置。点击开始检测后，只分析框选区域。');
+      } else {
+        setMessage('框选范围太小，请重新拖动选择。');
+      }
+    }
+
+    roiDragStateRef.current = null;
+    setRoiDraft(null);
+    setActiveTool(null);
+    suppressNextCanvasClickRef.current = true;
+  }
+
+  function handleOverlayClick(event: MouseEvent<SVGSVGElement>) {
+    if (suppressNextCanvasClickRef.current) {
+      suppressNextCanvasClickRef.current = false;
+      event.stopPropagation();
+      return;
+    }
+    if (activeTool !== 'target') return;
+
+    const point = getImagePoint(event.clientX, event.clientY);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setActiveTool(null);
+    void runDetection({ targetPoint: point });
+  }
+
   function handleBoxPointerDown(event: ReactPointerEvent<Element>, detection: Detection) {
-    if (isMobileReview) return;
+    if (isMobileReview || activeTool !== null) return;
 
     event.preventDefault();
     event.stopPropagation();
@@ -376,12 +686,13 @@ export function App() {
       width,
       height,
       moved: false,
+      beforeSnapshot: createSnapshot(),
     };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
   function handleResizePointerDown(event: ReactPointerEvent<Element>, detection: Detection, corner: ResizeCorner) {
-    if (isMobileReview) return;
+    if (isMobileReview || activeTool !== null) return;
 
     event.preventDefault();
     event.stopPropagation();
@@ -403,6 +714,7 @@ export function App() {
       width,
       height,
       moved: false,
+      beforeSnapshot: createSnapshot(),
     };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
@@ -440,6 +752,7 @@ export function App() {
     }
 
     if (dragState.moved) {
+      pushHistory(dragState.beforeSnapshot);
       suppressNextBoxClickRef.current = true;
       setMessage(dragState.mode === 'resize' ? '区域大小已调整。' : '区域位置已调整。');
     }
@@ -448,7 +761,7 @@ export function App() {
 
   function handleBoxClick(event: MouseEvent<Element>, id: string, count: number) {
     event.stopPropagation();
-    if (isMobileReview) return;
+    if (isMobileReview || activeTool !== null) return;
 
     if (suppressNextBoxClickRef.current) {
       suppressNextBoxClickRef.current = false;
@@ -464,7 +777,7 @@ export function App() {
   }
 
   function handleImageClick(event: MouseEvent<HTMLDivElement>) {
-    if (isMobileReview || !addMode || !imageRef.current || imageSize.width === 0 || imageSize.height === 0) return;
+    if (isMobileReview || activeTool !== 'add' || !imageRef.current || imageSize.width === 0 || imageSize.height === 0) return;
 
     const nextCount = promptForCount(1);
     if (nextCount === null) return;
@@ -480,6 +793,7 @@ export function App() {
       Math.round(size),
     ];
 
+    pushHistory();
     setDetections((current) => relabel([...current, { id: `manual_${Date.now()}`, bbox, area: size * size, count: nextCount, manual: true }]));
     setMessage(`已手动添加一个数量为 ${nextCount} 的区域。`);
   }
@@ -522,13 +836,23 @@ export function App() {
   const imageMeta = imageSize.width && imageSize.height ? `${imageSize.width} x ${imageSize.height}` : '未载入图片';
   const selectedFileName = file?.name ?? '';
   const fileNameParts = file ? splitFileName(file.name) : null;
+  const visibleRegion = roiDraft ?? detectionRegion;
+  const stageModeLabel = isMobileReview && activeTool === null
+    ? hasImage ? '手机端查看标注' : '等待照片'
+    : activeTool === 'target'
+      ? '点击一个目标零件'
+      : activeTool === 'roi'
+        ? '拖动框选检测范围'
+        : activeTool === 'add'
+          ? '点按图片添加区域'
+          : hasImage ? '拖动框可调整' : '等待照片';
 
   return (
     <main className="app-shell">
       <section className="topbar">
         <div className="brand-block">
           <div>
-            <p className="eyebrow">CountSnap v0.2</p>
+            <p className="eyebrow">CountSnap v0.3</p>
             <h1>拍照数物体</h1>
             <p className="subtitle">上传或现场拍摄照片，自动框选分散物体，再按实际情况微调数量。</p>
           </div>
@@ -582,7 +906,7 @@ export function App() {
                     key={item.value}
                     className={mode === item.value ? 'mode-option active' : 'mode-option'}
                     type="button"
-                    onClick={() => setMode(item.value)}
+                    onClick={() => changeDetectionMode(item.value)}
                   >
                     {item.label}
                   </button>
@@ -591,7 +915,7 @@ export function App() {
             </div>
             <label className="wide-field native-mode-field">
               检测模式
-              <select value={mode} onChange={(event) => setMode(event.target.value as typeof mode)}>
+              <select value={mode} onChange={(event) => changeDetectionMode(event.target.value as typeof mode)}>
                 {detectionModes.map((item) => (
                   <option key={item.value} value={item.value}>
                     {item.label}
@@ -661,13 +985,35 @@ export function App() {
           </div>
 
           <div className="action-stack">
-            <button className="primary-button" disabled={!hasImage || isDetecting} onClick={runDetection}>
+            <button className="primary-button" disabled={!hasImage || isDetecting} onClick={() => void runDetection()}>
+              <ScanSearch aria-hidden="true" size={18} />
               {isDetecting ? '检测中...' : '开始检测'}
             </button>
-            <button className={addMode ? 'secondary-button manual-region-button active' : 'secondary-button manual-region-button'} disabled={!hasImage || isMobileReview} onClick={() => setAddMode((value) => !value)}>
-              {addMode ? '手动加框已开启' : '手动添加区域'}
-            </button>
+            <div className="tool-grid">
+              <button className={activeTool === 'target' ? 'secondary-button active' : 'secondary-button'} disabled={!hasImage || mode !== 'repeat_contours' || isDetecting} onClick={() => toggleCanvasTool('target')} title="点击一个零件并寻找相似目标">
+                <Crosshair aria-hidden="true" size={16} />
+                {activeTool === 'target' ? '取消选择' : '选择目标'}
+              </button>
+              <button className={activeTool === 'roi' ? 'secondary-button active' : 'secondary-button'} disabled={!hasImage || mode !== 'repeat_contours' || isDetecting} onClick={() => toggleCanvasTool('roi')} title="框选需要检测的图片范围">
+                <SquareDashedMousePointer aria-hidden="true" size={16} />
+                {activeTool === 'roi' ? '取消框选' : '框选范围'}
+              </button>
+              <button className="secondary-button" disabled={!detectionRegion || isDetecting} onClick={clearDetectionRegion} title="清除当前检测范围">
+                <Trash2 aria-hidden="true" size={16} />
+                清除范围
+              </button>
+              <button className={activeTool === 'add' ? 'secondary-button manual-region-button active' : 'secondary-button manual-region-button'} disabled={!hasImage || isMobileReview} onClick={() => toggleCanvasTool('add')}>
+                <Plus aria-hidden="true" size={16} />
+                {activeTool === 'add' ? '取消加框' : '手动加框'}
+              </button>
+            </div>
+            <div className="history-toolbar">
+              <button className="secondary-button" disabled={!historyPast.length} onClick={undoEdit} title="撤销上一步操作"><Undo2 aria-hidden="true" size={16} />撤销</button>
+              <button className="secondary-button" disabled={!historyFuture.length} onClick={redoEdit} title="重做上一步操作"><Redo2 aria-hidden="true" size={16} />重做</button>
+              <button className="secondary-button" disabled={!repeatInfo?.selectedGroupId || !automaticDetectionsRef.current[repeatInfo.selectedGroupId]} onClick={restoreAutomaticResult} title="恢复当前候选组最初的检测框"><RotateCcw aria-hidden="true" size={16} />恢复</button>
+            </div>
             <button className="secondary-button" disabled={!detections.length} onClick={exportAnnotatedImage}>
+              <Download aria-hidden="true" size={17} />
               导出标注图
             </button>
           </div>
@@ -689,7 +1035,7 @@ export function App() {
               <h2>检测画布</h2>
             </div>
             <div className="stage-meta">
-              <b>{isMobileReview && hasImage ? '手机端查看标注' : addMode ? '点按图片添加区域' : hasImage ? '拖动框可调整' : '等待照片'}</b>
+              <b>{stageModeLabel}</b>
               <small>{file ? imageMeta : '空画布'}</small>
             </div>
           </div>
@@ -702,7 +1048,26 @@ export function App() {
                 alt="已上传的待检测照片"
                 onLoad={(event) => setImageSize({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })}
               />
-              <svg className="overlay" viewBox={`0 0 ${scaleX} ${scaleY}`} preserveAspectRatio="none">
+              <svg
+                className={activeTool === 'target' || activeTool === 'roi' ? 'overlay interaction-mode' : 'overlay'}
+                viewBox={`0 0 ${scaleX} ${scaleY}`}
+                preserveAspectRatio="none"
+                onPointerDown={handleOverlayPointerDown}
+                onPointerMove={handleOverlayPointerMove}
+                onPointerUp={handleOverlayPointerUp}
+                onPointerCancel={handleOverlayPointerUp}
+                onClick={handleOverlayClick}
+              >
+                {visibleRegion && (
+                  <>
+                    <path
+                      className="roi-shade"
+                      d={`M 0 0 H ${scaleX} V ${scaleY} H 0 Z M ${visibleRegion.x} ${visibleRegion.y} H ${visibleRegion.x + visibleRegion.width} V ${visibleRegion.y + visibleRegion.height} H ${visibleRegion.x} Z`}
+                      fillRule="evenodd"
+                    />
+                    <rect className="roi-region" x={visibleRegion.x} y={visibleRegion.y} width={visibleRegion.width} height={visibleRegion.height} />
+                  </>
+                )}
                 {detections.map((detection, index) => {
                   const [x, y, w, h] = detection.bbox;
                   const displayLabel = `${index + 1}${detection.count > 1 ? ` x${detection.count}` : ''}`;
@@ -720,6 +1085,7 @@ export function App() {
                     <g
                       key={detection.id}
                       className={detection.manual ? 'manual-box' : 'detected-box'}
+                      style={{ pointerEvents: activeTool === 'target' || activeTool === 'roi' ? 'none' : 'auto' }}
                       onPointerDown={(event) => handleBoxPointerDown(event, detection)}
                       onPointerMove={handleBoxPointerMove}
                       onPointerUp={handleBoxPointerUp}
@@ -759,6 +1125,13 @@ export function App() {
                     </g>
                   );
                 })}
+                {targetReference && (
+                  <g className="target-reference" pointerEvents="none">
+                    <circle cx={targetReference.x} cy={targetReference.y} r={Math.max(12, Math.min(scaleX, scaleY) * 0.018)} />
+                    <line x1={targetReference.x - 20} y1={targetReference.y} x2={targetReference.x + 20} y2={targetReference.y} />
+                    <line x1={targetReference.x} y1={targetReference.y - 20} x2={targetReference.x} y2={targetReference.y + 20} />
+                  </g>
+                )}
               </svg>
             </div>
           )}
@@ -780,6 +1153,24 @@ export function App() {
             <span>{detections.length}</span>
             <b>个识别区域</b>
           </div>
+          {repeatInfo && repeatInfo.groups.length > 0 && (
+            <div className="repeat-group-list" aria-label="候选重复组">
+              {repeatInfo.groups.map((group, index) => (
+                <button
+                  key={group.id}
+                  className={group.id === repeatInfo.selectedGroupId ? 'repeat-group-option active' : 'repeat-group-option'}
+                  onClick={() => selectRepeatGroup(group.id)}
+                >
+                  <i style={{ backgroundColor: group.color.hex }} />
+                  <span>
+                    <b>候选组 {index + 1}</b>
+                    <small>{group.count} 个 · 相似 {Math.round(group.meanSimilarity * 100)}%</small>
+                  </span>
+                  <em>{group.meetsMinimum ? '可采用' : '数量不足'}</em>
+                </button>
+              ))}
+            </div>
+          )}
           <div className="detection-list">
             {!detections.length && <p className="result-empty">{isMobileReview ? '还没有识别区域。上传照片后开始检测。' : '还没有识别区域。上传照片后开始检测，或开启手动加框。'}</p>}
             {detections.map((detection, index) => (
@@ -814,6 +1205,32 @@ function getApiUrl(path: string) {
 
 function relabel(items: Detection[]) {
   return items.map((item, index) => ({ ...item, count: Math.max(1, Math.floor(item.count || 1)), label: String(index + 1) }));
+}
+
+function cloneDetections(items: Detection[]) {
+  return items.map((item) => ({ ...item, bbox: [...item.bbox] as Detection['bbox'] }));
+}
+
+function cloneRegion(region: DetectionRegion | null) {
+  return region ? { ...region } : null;
+}
+
+function regionFromPoints(startX: number, startY: number, endX: number, endY: number): DetectionRegion {
+  return {
+    x: Math.min(startX, endX),
+    y: Math.min(startY, endY),
+    width: Math.abs(endX - startX),
+    height: Math.abs(endY - startY),
+  };
+}
+
+function roundRegion(region: DetectionRegion): DetectionRegion {
+  return {
+    x: Math.round(region.x),
+    y: Math.round(region.y),
+    width: Math.round(region.width),
+    height: Math.round(region.height),
+  };
 }
 
 function clamp(value: number, min: number, max: number) {

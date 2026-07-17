@@ -384,13 +384,107 @@ def _build_repeat_groups(candidates: list[dict], scale: float) -> list[dict]:
     return groups
 
 
+def _build_target_repeat_group(
+    candidates: list[dict],
+    target_point: tuple[float, float],
+    scale: float,
+) -> dict | None:
+    if not candidates:
+        return None
+
+    target_x, target_y = target_point
+    containing = []
+    nearby = []
+    for candidate in candidates:
+        x, y, w, h = candidate["bbox"]
+        center_x = x + w / 2
+        center_y = y + h / 2
+        distance = float(np.hypot(target_x - center_x, target_y - center_y))
+        if x <= target_x <= x + w and y <= target_y <= y + h:
+            containing.append((distance, candidate))
+        else:
+            nearby.append((distance, candidate))
+
+    if containing:
+        reference = min(containing, key=lambda item: item[0])[1]
+    else:
+        distance, reference = min(nearby, key=lambda item: item[0])
+        _, _, reference_w, reference_h = reference["bbox"]
+        if distance > max(18.0, max(reference_w, reference_h) * 0.7):
+            return None
+
+    members = [reference["index"]]
+    member_similarities = [1.0]
+    for candidate in candidates:
+        if candidate["index"] == reference["index"]:
+            continue
+        similarity, shape_distance = _repeat_similarity(reference, candidate)
+        area_ratio = min(reference["area"], candidate["area"]) / max(reference["area"], candidate["area"])
+        color_distance = float(np.linalg.norm(reference["labColor"] - candidate["labColor"]))
+        if similarity >= 0.58 and area_ratio >= 0.42 and shape_distance <= 0.72 and color_distance <= 50.0:
+            members.append(candidate["index"])
+            member_similarities.append(similarity)
+
+    member_candidates = [candidates[index] for index in members]
+    areas = np.array([candidate["area"] for candidate in member_candidates], dtype=float)
+    median_area = float(np.median(areas))
+    area_cv = float(np.std(areas) / median_area) if median_area else 2.0
+    mean_similarity = float(np.mean(member_similarities))
+    median_lab = np.median(np.array([candidate["labColor"] for candidate in member_candidates]), axis=0)
+    rgb, hex_color = _lab_center_to_rgb(median_lab)
+    score = len(members) * 5.0 + mean_similarity * 22.0 + 10.0 / (1.0 + area_cv * 4.0)
+    return {
+        "id": "target_group",
+        "members": members,
+        "count": len(members),
+        "score": round(float(score), 3),
+        "meanSimilarity": round(mean_similarity, 3),
+        "medianArea": round(median_area / (scale * scale), 2),
+        "areaCv": round(area_cv, 3),
+        "color": {"rgb": rgb, "hex": hex_color},
+        "selectionMethod": "target_point",
+        "referenceCandidateIndex": reference["index"],
+    }
+
+
+def _normalize_roi(
+    width: int,
+    height: int,
+    roi: tuple[int, int, int, int] | None,
+) -> tuple[int, int, int, int] | None:
+    if roi is None:
+        return None
+
+    x, y, roi_width, roi_height = roi
+    x = int(np.clip(x, 0, max(0, width - 1)))
+    y = int(np.clip(y, 0, max(0, height - 1)))
+    roi_width = int(np.clip(roi_width, 1, width - x))
+    roi_height = int(np.clip(roi_height, 1, height - y))
+    if roi_width < 12 or roi_height < 12:
+        return None
+    return x, y, roi_width, roi_height
+
+
 def detect_repeated_contours(
     image_bytes: bytes,
     min_area: int = 900,
     min_repeat: int = 8,
     cluster_count: int = 10,
+    target_point: tuple[float, float] | None = None,
+    roi: tuple[int, int, int, int] | None = None,
 ) -> dict:
     _, work, scale, width, height = _decode_work_image(image_bytes)
+    normalized_roi = _normalize_roi(width, height, roi)
+    offset_x = 0
+    offset_y = 0
+    if normalized_roi:
+        roi_x, roi_y, roi_width, roi_height = normalized_roi
+        offset_x = int(round(roi_x * scale))
+        offset_y = int(round(roi_y * scale))
+        crop_x2 = min(work.shape[1], int(round((roi_x + roi_width) * scale)))
+        crop_y2 = min(work.shape[0], int(round((roi_y + roi_height) * scale)))
+        work = work[offset_y:crop_y2, offset_x:crop_x2]
+
     work_height, work_width = work.shape[:2]
     lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB).astype(np.float32)
 
@@ -414,7 +508,15 @@ def detect_repeated_contours(
             "imageHeight": height,
             "detections": [],
             "selectedRepeatGroup": None,
+            "selectedGroupId": None,
             "repeatGroups": [],
+            "candidateCount": 0,
+            "targetMatched": target_point is None,
+            "roi": (
+                {"x": normalized_roi[0], "y": normalized_roi[1], "width": normalized_roi[2], "height": normalized_roi[3]}
+                if normalized_roi
+                else None
+            ),
             "params": {"mode": "repeat_contours", "minArea": min_area, "minRepeat": min_repeat},
         }
 
@@ -426,38 +528,77 @@ def detect_repeated_contours(
     scaled_min_area = max(45.0, min_area * scale * scale)
     candidates = _extract_repeat_candidates(work, lab, centers, samples, labels, scaled_min_area)
     groups = _build_repeat_groups(candidates, scale)
-    selected_group = next((group for group in groups if group["count"] >= min_repeat), None)
+    for index, group in enumerate(groups, start=1):
+        group["id"] = f"group_{index}"
 
-    detections = []
-    if selected_group:
-        for candidate_index in selected_group["members"]:
+    target_group = None
+    target_matched = target_point is None
+    if target_point is not None:
+        local_target = (target_point[0] * scale - offset_x, target_point[1] * scale - offset_y)
+        if 0 <= local_target[0] <= work_width and 0 <= local_target[1] <= work_height:
+            target_group = _build_target_repeat_group(candidates, local_target, scale)
+        target_matched = target_group is not None
+
+    selected_group = target_group if target_group else next((group for group in groups if group["count"] >= min_repeat), None)
+    response_groups = groups[:8]
+    if target_group:
+        matching_group = next(
+            (group for group in response_groups if set(group["members"]) == set(target_group["members"])),
+            None,
+        )
+        if matching_group:
+            matching_group["selectionMethod"] = "target_point"
+            matching_group["referenceCandidateIndex"] = target_group["referenceCandidateIndex"]
+            selected_group = matching_group
+        else:
+            response_groups = [target_group, *response_groups[:7]]
+
+    public_groups = []
+    for group in response_groups:
+        group_detections = []
+        for candidate_index in group["members"]:
             candidate = candidates[candidate_index]
-            x, y, w, h = candidate["bbox"]
-            detections.append(
+            x, y, candidate_width, candidate_height = candidate["bbox"]
+            group_detections.append(
                 {
-                    "id": f"repeat_{uuid.uuid4().hex[:8]}",
-                    "bbox": [round(x / scale), round(y / scale), round(w / scale), round(h / scale)],
+                    "id": f"{group['id']}_{candidate_index}",
+                    "bbox": [
+                        round((x + offset_x) / scale),
+                        round((y + offset_y) / scale),
+                        round(candidate_width / scale),
+                        round(candidate_height / scale),
+                    ],
                     "area": round(candidate["area"] / (scale * scale), 2),
                     "count": 1,
                 }
             )
+        group_detections.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+        for index, detection in enumerate(group_detections, start=1):
+            detection["label"] = str(index)
 
-    detections.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
-    for index, detection in enumerate(detections, start=1):
-        detection["label"] = str(index)
+        public_group = {key: value for key, value in group.items() if key != "members"}
+        public_group["meetsMinimum"] = group["count"] >= min_repeat
+        public_group["detections"] = group_detections
+        public_groups.append(public_group)
 
-    public_groups = [{key: value for key, value in group.items() if key != "members"} for group in groups[:8]]
-    public_selected_group = (
-        {key: value for key, value in selected_group.items() if key != "members"} if selected_group else None
-    )
+    selected_group_id = selected_group["id"] if selected_group else None
+    public_selected_group = next((group for group in public_groups if group["id"] == selected_group_id), None)
+    detections = public_selected_group["detections"] if public_selected_group else []
     return {
         "count": len(detections),
         "imageWidth": width,
         "imageHeight": height,
         "detections": detections,
         "selectedRepeatGroup": public_selected_group,
+        "selectedGroupId": selected_group_id,
         "repeatGroups": public_groups,
         "candidateCount": len(candidates),
+        "targetMatched": target_matched,
+        "roi": (
+            {"x": normalized_roi[0], "y": normalized_roi[1], "width": normalized_roi[2], "height": normalized_roi[3]}
+            if normalized_roi
+            else None
+        ),
         "params": {
             "mode": "repeat_contours",
             "minArea": min_area,

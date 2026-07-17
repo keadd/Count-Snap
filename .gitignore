@@ -18,6 +18,9 @@ dist/
 backend/debug-*.jpg
 backend/debug-*.png
 
+# Local development documents
+dev-docs/
+
 # OS/editor noise
 .DS_Store
 Thumbs.db

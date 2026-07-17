@@ -31,6 +31,29 @@ def _make_repeated_parts_image(part_count: int) -> bytes:
     return buffer.tobytes()
 
 
+def _make_two_groups_image() -> bytes:
+    image = np.full((760, 1200, 3), 238, dtype=np.uint8)
+    base_shape = np.array(
+        [[-28, -18], [-7, -30], [25, -22], [35, 4], [19, 28], [-15, 27], [-36, 7]],
+        dtype=np.float32,
+    )
+    for index in range(10):
+        row, column = divmod(index, 5)
+        transform = cv2.getRotationMatrix2D((0, 0), (index % 3 - 1) * 8, 1.0)
+        points = cv2.transform(base_shape[None, :, :], transform)[0]
+        points += np.array([100 + column * 105, 180 + row * 210])
+        cv2.fillPoly(image, [np.round(points).astype(np.int32)], (40, 55, 220))
+
+    for index in range(9):
+        row, column = divmod(index, 3)
+        cv2.circle(image, (760 + column * 120, 150 + row * 180), 30 + index % 2, (220, 80, 35), -1)
+
+    encoded, buffer = cv2.imencode(".png", image)
+    if not encoded:
+        raise RuntimeError("Could not encode synthetic two-group image.")
+    return buffer.tobytes()
+
+
 class RepeatedContourDetectionTests(unittest.TestCase):
     def test_counts_repeated_irregular_parts(self) -> None:
         result = detect_repeated_contours(
@@ -53,6 +76,38 @@ class RepeatedContourDetectionTests(unittest.TestCase):
         self.assertEqual(result["count"], 0)
         self.assertIsNone(result["selectedRepeatGroup"])
         self.assertEqual(result["repeatGroups"][0]["count"], 7)
+
+    def test_returns_multiple_groups_with_detections(self) -> None:
+        result = detect_repeated_contours(_make_two_groups_image(), min_area=600, min_repeat=8)
+
+        self.assertEqual([group["count"] for group in result["repeatGroups"][:2]], [10, 9])
+        self.assertEqual(len(result["repeatGroups"][0]["detections"]), 10)
+        self.assertEqual(len(result["repeatGroups"][1]["detections"]), 9)
+        self.assertEqual(result["selectedGroupId"], result["repeatGroups"][0]["id"])
+
+    def test_target_point_selects_matching_group(self) -> None:
+        result = detect_repeated_contours(
+            _make_two_groups_image(),
+            min_area=600,
+            min_repeat=8,
+            target_point=(760, 150),
+        )
+
+        self.assertTrue(result["targetMatched"])
+        self.assertEqual(result["count"], 9)
+        self.assertEqual(result["selectedGroupId"], result["repeatGroups"][1]["id"])
+
+    def test_roi_excludes_groups_outside_region(self) -> None:
+        result = detect_repeated_contours(
+            _make_two_groups_image(),
+            min_area=600,
+            min_repeat=8,
+            roi=(20, 80, 570, 430),
+        )
+
+        self.assertEqual(result["count"], 10)
+        self.assertEqual(len(result["repeatGroups"]), 1)
+        self.assertEqual(result["roi"], {"x": 20, "y": 80, "width": 570, "height": 430})
 
 
 if __name__ == "__main__":
