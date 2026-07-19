@@ -13,6 +13,7 @@ dist/
 *.log
 *.out.log
 *.err.log
+.env
 
 # Generated debug images
 backend/debug-*.jpg

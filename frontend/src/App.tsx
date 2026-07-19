@@ -1406,8 +1406,7 @@ export function App() {
 }
 
 function getApiUrl(path: string) {
-  const { protocol, hostname } = window.location;
-  return `${protocol}//${hostname}:8000${path}`;
+  return path;
 }
 
 function relabel(items: Detection[]) {

@@ -48,6 +48,7 @@ Count-Snap/
 │   ├── app/
 │   │   ├── main.py          # FastAPI 入口和接口定义
 │   │   └── detection.py     # OpenCV 检测逻辑
+│   ├── Dockerfile
 │   ├── requirements.txt
 │   └── test-detect.png
 ├── frontend/
@@ -55,14 +56,61 @@ Count-Snap/
 │   │   ├── App.tsx          # 主界面和交互逻辑
 │   │   ├── main.tsx
 │   │   └── styles.css
+│   ├── Dockerfile
+│   ├── nginx.conf
 │   ├── package.json
 │   └── vite.config.ts
+├── compose.yaml
 ├── .gitignore
 ├── LICENSE
 └── README.md
 ```
 
-## 快速开始
+## Docker 一键启动
+
+安装 Docker Desktop，或者安装带有 Docker Compose 的 Docker Engine，然后执行：
+
+```powershell
+git clone https://github.com/keadd/Count-Snap.git
+cd Count-Snap
+docker compose up -d --build
+```
+
+构建完成后打开：
+
+```text
+http://localhost:8080
+```
+
+Compose 会启动两个容器：
+
+- `frontend`：使用 Nginx 提供前端页面，并把 `/api` 请求转发给后端
+- `backend`：运行 FastAPI 和 OpenCV，只在 Docker 内部开放 `8000` 端口
+
+外部只需要访问前端的一个端口。若要修改默认的 `8080` 端口，可以复制 `.env.example` 为 `.env`，然后修改：
+
+```text
+COUNTSNAP_PORT=8080
+```
+
+常用命令：
+
+```powershell
+# 查看容器状态
+docker compose ps
+
+# 查看日志
+docker compose logs -f
+
+# 拉取更新并重新构建
+git pull
+docker compose up -d --build
+
+# 停止并删除容器
+docker compose down
+```
+
+## 本地开发
 
 ### 1. 启动后端
 
@@ -110,15 +158,21 @@ http://localhost:5173
 
 1. 确保电脑和手机连接到同一个 Wi-Fi
 2. 在电脑上用 `ipconfig` 查看局域网 IP，例如 `192.168.1.23`
-3. 手机浏览器打开 Vite 地址，把 `localhost` 换成电脑 IP
+3. Docker 部署时访问 `8080`，本地开发时访问 Vite 的 `5173`
 
-示例：
+Docker 部署示例：
+
+```text
+http://192.168.1.23:8080
+```
+
+本地开发示例：
 
 ```text
 http://192.168.1.23:5173
 ```
 
-后端需要保持运行，并监听在 `0.0.0.0:8000`。
+如果其他设备无法访问，需要允许 Docker 或对应端口通过系统防火墙。
 
 ## 检测模式
 

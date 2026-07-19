@@ -1,0 +1,12 @@
+.venv/
+venv/
+**/__pycache__/
+**/*.py[cod]
+tests/
+local-test-data/
+debug-*.jpg
+debug-*.png
+*.log
+*.out.log
+*.err.log
+test-detect.png
